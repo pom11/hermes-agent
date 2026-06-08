@@ -3301,9 +3301,16 @@ class AIAgent:
         Only the first occurrence of each unique pair is kept.
         Returns the original list if no duplicates were found.
         """
+        # Liveness pings are idempotent signals, not accidental dupes —
+        # deduping them silently drops heartbeats and lets a healthy
+        # long-running worker get reclaimed as "no heartbeat".
+        _dedup_exempt = {"kanban_heartbeat"}
         seen: set = set()
         unique: list = []
         for tc in tool_calls:
+            if tc.function.name in _dedup_exempt:
+                unique.append(tc)
+                continue
             key = (tc.function.name, tc.function.arguments)
             if key not in seen:
                 seen.add(key)

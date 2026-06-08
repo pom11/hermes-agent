@@ -49,7 +49,7 @@ import tempfile
 import threading
 import uuid
 from pathlib import Path
-from typing import Callable, Dict, Any, Optional
+from typing import Callable, Dict, Any, List, Optional
 from urllib.parse import urljoin
 
 from hermes_constants import display_hermes_home
@@ -1694,6 +1694,68 @@ def _resolve_piper_voice_path(voice: str, download_dir: Path) -> str:
     return str(cached)
 
 
+# Language-to-Piper-voice mapping. Keys are detected language codes.
+# Values are lists ordered by quality preference (best first).
+PIPER_VOICE_MAP: Dict[str, List[str]] = {
+    "ro": ["ro_RO-mihai-medium"],
+    "en": ["en_US-lessac-medium", "en_US-ryan-medium"],
+    "de": ["de_DE-thomas-medium"],
+    "fr": ["fr_FR-henri-medium"],
+    "es": ["es_ES-carlfm-medium"],
+    "it": ["it_IT-aurora-medium"],
+    "pt": ["pt_BR-edresson-medium"],
+}
+
+# Primary: Romanian diacritics — definitive proof
+_ROMANIAN_CHARS = re.compile(r"[ăâîșțĂÂÎȘȚşţŞŢ]")
+
+# Distinctive Romanian words not found in English
+_ROMANIAN_WORDS = [
+    "sistemul", "sistemele", "toate", "funcționează",
+    "serverul", "operațional", "operativ", "nereceptor", "receptor",
+    "buna", "seara", "dimineața", "zile", "noaptea", "multumesc",
+    "mulțumesc", "întrebat", "căutat",
+]
+# Common English words (to suppress false positives from short Romanian words)
+_ENGLISH_WORDS = [
+    "the", "and", "are", "was", "for", "all", "with", "this",
+    "that", "from", "have", "been", "will", "just", "about",
+    "which", "their", "there", "would", "make", "like", "into",
+    "over", "such", "time", "after", "other", "when", "than",
+    "some", "also", "many", "most", "only", "now", "out",
+    "new", "up", "well", "can", "but", "not", "has", "had",
+    "get", "got", "did", "its", "our", "way", "use",
+]
+
+
+def _detect_language(text: str) -> str:
+    """Detect language: 'ro' for Romanian, 'en' as fallback."""
+    if not text:
+        return "en"
+    # 1. Diacritics check — definitive
+    if _ROMANIAN_CHARS.search(text):
+        return "ro"
+    # 2. Word-level check — compare Romanian vs English word counts
+    lower = text.lower()
+    ro_count = sum(1 for w in _ROMANIAN_WORDS if w.lower() in lower)
+    en_count = sum(1 for w in _ENGLISH_WORDS if w in lower)
+    if ro_count > 0 and ro_count >= en_count:
+        return "ro"
+    return "en"
+
+
+def _resolve_piper_voice(text: str, tts_config: Dict[str, Any]) -> str:
+    """Resolve voice name, with auto-detect for Romanian vs English."""
+    piper_config = tts_config.get("piper") if isinstance(tts_config.get("piper"), dict) else {}
+    voice_override = piper_config.get("voice") if piper_config else None
+    if voice_override:
+        # User explicitly set a voice — honor it (including path to .onnx)
+        return voice_override
+    lang = _detect_language(text)
+    voices = PIPER_VOICE_MAP.get(lang, PIPER_VOICE_MAP["en"])
+    return voices[0]
+
+
 def _generate_piper_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
     """Generate speech using the local Piper engine.
 
@@ -1705,7 +1767,7 @@ def _generate_piper_tts(text: str, output_path: str, tts_config: Dict[str, Any])
     import wave
 
     piper_config = tts_config.get("piper", {}) if isinstance(tts_config, dict) else {}
-    voice_name = piper_config.get("voice") or DEFAULT_PIPER_VOICE
+    voice_name = _resolve_piper_voice(text, tts_config)
     download_dir = Path(piper_config.get("voices_dir") or _get_piper_voices_dir()).expanduser()
     download_dir.mkdir(parents=True, exist_ok=True)
     use_cuda = bool(piper_config.get("use_cuda", False))
@@ -2263,6 +2325,7 @@ _MD_EXCESS_NL = re.compile(r'\n{3,}')
 
 def _strip_markdown_for_tts(text: str) -> str:
     """Remove markdown formatting that shouldn't be spoken aloud."""
+    text = re.sub(r'<think[\s>].*?</think>', ' ', text, flags=re.DOTALL)
     text = _MD_CODE_BLOCK.sub(' ', text)
     text = _MD_LINK.sub(r'\1', text)
     text = _MD_URL.sub('', text)
