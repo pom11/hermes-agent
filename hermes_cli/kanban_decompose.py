@@ -214,6 +214,24 @@ def _resolve_default_assignee(cfg: dict) -> str:
         return "default"
 
 
+def _review_policy(cfg):
+    """Return the kanban.auto_review policy dict, or {} when not configured.
+
+    Shape: {"review_roles": [...], "reviewer": "<profile>"}. Missing or
+    malformed config returns {} so callers treat review-pairing as disabled.
+    """
+    kanban_cfg = (cfg or {}).get("kanban", {}) if isinstance(cfg, dict) else {}
+    policy = kanban_cfg.get("auto_review")
+    if not isinstance(policy, dict):
+        return {}
+    roles = policy.get("review_roles")
+    reviewer = policy.get("reviewer")
+    if not isinstance(roles, list) or not isinstance(reviewer, str):
+        return {}
+    return {"review_roles": [str(r).strip() for r in roles if str(r).strip()],
+            "reviewer": reviewer.strip()}
+
+
 def _build_roster() -> tuple[list[dict], set[str]]:
     """Return (roster_for_prompt, valid_assignee_names).
 

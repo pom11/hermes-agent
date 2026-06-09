@@ -50,3 +50,16 @@ def test_pair_empty_policy_noop():
     children = [{"title": "X", "body": "", "assignee": "coder", "parents": []}]
     assert kd._pair_review_tasks(children, policy={}) == children
     assert kd._pair_review_tasks(children, policy=None) == children
+
+
+def test_review_policy_reads_config():
+    cfg = {"kanban": {"auto_review": {"review_roles": ["coder", "backend-engineer"],
+                                      "reviewer": "reviewer"}}}
+    pol = kd._review_policy(cfg)
+    assert pol["reviewer"] == "reviewer"
+    assert "coder" in pol["review_roles"]
+
+
+def test_review_policy_absent_returns_empty():
+    assert kd._review_policy({}) == {}
+    assert kd._review_policy({"kanban": {}}) == {}
