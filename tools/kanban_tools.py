@@ -274,6 +274,41 @@ def _normalize_profile(value: Any) -> Optional[str]:
     return text
 
 
+def _default_assignee() -> Optional[str]:
+    """The configured kanban.default_assignee, or None."""
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        da = (cfg.get("kanban", {}) or {}).get("default_assignee")
+        return str(da).strip() or None if da else None
+    except Exception:
+        return None
+
+
+def _resolve_valid_assignee(assignee: str) -> tuple[str, Optional[str]]:
+    """Map a requested assignee to a real on-disk profile.
+
+    Agents sometimes pass a generic name (e.g. "worker") that is NOT a profile
+    on disk — the dispatcher silently skips such cards, stranding them in
+    ``ready`` forever. Mirror the decomposer's guarantee: if the requested
+    assignee isn't a real profile, rewrite it to kanban.default_assignee.
+    Returns (effective_assignee, note) where note is a human-readable string
+    when a rewrite happened (else None). If neither the requested name nor the
+    default resolves, returns the original (best-effort — never silently drops).
+    """
+    try:
+        from hermes_cli.profiles import profile_exists
+    except Exception:
+        return assignee, None  # can't validate — leave as-is
+    if profile_exists(assignee):
+        return assignee, None
+    default = _default_assignee()
+    if default and profile_exists(default):
+        return default, (f"assignee '{assignee}' is not a profile on disk; "
+                         f"routed to default_assignee '{default}'")
+    return assignee, None
+
+
 def _parse_bool_arg(args: dict, name: str, *, default: bool = False):
     value = args.get(name)
     if value is None:
@@ -735,6 +770,13 @@ def _handle_create(args: dict, **kw) -> str:
             "assignee is required — name the profile that should execute this "
             "task (the dispatcher will only spawn tasks with an assignee)"
         )
+    # Guard against stranded cards: an assignee that is not a real on-disk
+    # profile (e.g. the generic "worker") is silently skipped by the dispatcher
+    # and sits in `ready` forever. Rewrite unknown assignees to the configured
+    # default_assignee, same guarantee the decomposer provides.
+    assignee, _assignee_note = _resolve_valid_assignee(str(assignee))
+    if _assignee_note:
+        logger.warning("kanban_create: %s", _assignee_note)
     body = args.get("body")
     parents = args.get("parents") or []
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
