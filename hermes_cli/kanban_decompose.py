@@ -268,6 +268,49 @@ def _normalize_assignee_choice(
     return chosen
 
 
+def _pair_review_tasks(children, policy):
+    """Append a reviewer task for each impl child whose role is in review_roles.
+
+    Pure transform: takes the built children list (each a dict with title,
+    body, assignee, parents=indices) and returns a NEW list with review
+    children appended. Each review child is gated behind its impl child via
+    ``parents=[impl_index]``. Review children are appended AFTER all impl
+    children so every pre-existing parent index stays valid.
+
+    ``policy`` is ``kanban.auto_review`` config:
+      {"review_roles": [<assignee names that produce reviewable work>],
+       "reviewer": "<reviewer profile name>"}
+    Empty/None policy or missing reviewer -> returns ``children`` unchanged.
+    A child already assigned to the reviewer is never paired (no review of a
+    review).
+    """
+    if not policy:
+        return children
+    review_roles = set(policy.get("review_roles") or [])
+    reviewer = (policy.get("reviewer") or "").strip()
+    if not review_roles or not reviewer:
+        return children
+    out = list(children)
+    for idx, child in enumerate(children):
+        assignee = child.get("assignee")
+        if assignee == reviewer:
+            continue
+        if assignee not in review_roles:
+            continue
+        out.append({
+            "title": f"review: {child.get('title', '')}".strip()[:200],
+            "body": (
+                "Review the work produced by the parent task. Read the diff for "
+                "correctness, run its tests and confirm they pass, and verify the "
+                "work matches the task spec. Approve, or send back with precise "
+                "change requests."
+            ),
+            "assignee": reviewer,
+            "parents": [idx],
+        })
+    return out
+
+
 def decompose_task(
     task_id: str,
     *,
