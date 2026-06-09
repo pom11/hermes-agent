@@ -76,3 +76,11 @@ def test_policy_and_transform_compose():
     assert len(out) == 2
     assert out[1]["assignee"] == "reviewer"
     assert out[1]["parents"] == [0]
+
+
+def test_decompose_no_longer_autopairs_reviews():
+    """Phase 3: built-in review path replaces Phase 2 auto-pairing.
+    auto_review is removed from config, so _review_policy returns {}."""
+    from hermes_cli import kanban_decompose as kd
+    from hermes_cli.config import load_config
+    assert kd._review_policy(load_config()) == {}

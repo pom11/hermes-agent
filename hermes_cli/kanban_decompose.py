@@ -499,11 +499,9 @@ def decompose_task(
             "parents": clean_parents,
         })
 
-    # Auto-pair a reviewer task onto each code-producing child (Phase 2).
-    # Policy-driven: kanban.auto_review.{review_roles, reviewer}. No-op when
-    # unconfigured. Review children are appended after all impl children so the
-    # impl parent indices above stay valid; each review is gated behind its impl.
-    children = _pair_review_tasks(children, _review_policy(cfg))
+    # NOTE: review is handled by the built-in review-status path (coders submit
+    # their own task to 'review'; the dispatcher spawns an sdlc-review agent).
+    # The Phase-2 auto-pairing (_pair_review_tasks) is intentionally NOT called.
 
     try:
         with kb.connect_closing() as conn:
