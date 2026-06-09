@@ -499,6 +499,12 @@ def decompose_task(
             "parents": clean_parents,
         })
 
+    # Auto-pair a reviewer task onto each code-producing child (Phase 2).
+    # Policy-driven: kanban.auto_review.{review_roles, reviewer}. No-op when
+    # unconfigured. Review children are appended after all impl children so the
+    # impl parent indices above stay valid; each review is gated behind its impl.
+    children = _pair_review_tasks(children, _review_policy(cfg))
+
     try:
         with kb.connect_closing() as conn:
             child_ids = kb.decompose_triage_task(

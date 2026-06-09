@@ -63,3 +63,16 @@ def test_review_policy_reads_config():
 def test_review_policy_absent_returns_empty():
     assert kd._review_policy({}) == {}
     assert kd._review_policy({"kanban": {}}) == {}
+
+
+def test_policy_and_transform_compose():
+    """Contract the Task-3 wiring performs inside decompose_task:
+    children = _pair_review_tasks(children, _review_policy(cfg))."""
+    cfg = {"kanban": {"auto_review": {"review_roles": ["backend-engineer"],
+                                      "reviewer": "reviewer"}}}
+    children = [{"title": "Build API", "body": "spec",
+                 "assignee": "backend-engineer", "parents": []}]
+    out = kd._pair_review_tasks(children, kd._review_policy(cfg))
+    assert len(out) == 2
+    assert out[1]["assignee"] == "reviewer"
+    assert out[1]["parents"] == [0]
