@@ -4164,6 +4164,38 @@ def block_task(
         return True
 
 
+def submit_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Transition ``running -> review`` so the dispatcher spawns a review agent.
+
+    Returns True on success, False if the task is not currently running. The
+    review consumer (claim_review_task + review-column dispatch) already exists;
+    this is the producer side. The task keeps its worktree for the review agent.
+    Clears claim_lock + claim_expires so the review dispatcher can claim it.
+    """
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status       = 'review',
+                   claim_lock   = NULL,
+                   claim_expires= NULL,
+                   worker_pid   = NULL
+             WHERE id = ?
+               AND status = 'running'
+            """,
+            (task_id,),
+        )
+        if cur.rowcount != 1:
+            return False
+        run_id = _end_run(
+            conn, task_id,
+            outcome="review",
+            status="review",
+            summary=None,
+        )
+        _append_event(conn, task_id, "submitted_review", {}, run_id=run_id)
+        return True
+
 
 def promote_task(
     conn: sqlite3.Connection,

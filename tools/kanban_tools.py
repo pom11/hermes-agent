@@ -668,6 +668,39 @@ def _handle_block(args: dict, **kw) -> str:
         return tool_error(f"kanban_block: {e}")
 
 
+def _handle_submit_review(args: dict, **kw) -> str:
+    """Submit the worker's own running task to review (running -> review).
+
+    This transitions the task to 'review' status so the dispatcher spawns a
+    review agent to check the diff, run tests, and either merge or request changes.
+    """
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error(
+            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
+        )
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            ok = kb.submit_review_task(conn, tid)
+            if not ok:
+                return tool_error(
+                    f"could not submit {tid} to review (task must be running)"
+                )
+            return _ok(task_id=tid, status="review")
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_submit_review: {e}")
+    except Exception as e:
+        logger.exception("kanban_submit_review failed")
+        return tool_error(f"kanban_submit_review: {e}")
+
+
 def _handle_heartbeat(args: dict, **kw) -> str:
     """Signal that the worker is still alive during a long operation.
 
@@ -1141,6 +1174,30 @@ KANBAN_BLOCK_SCHEMA = {
     },
 }
 
+KANBAN_SUBMIT_REVIEW_SCHEMA = {
+    "name": "kanban_submit_review",
+    "description": (
+        "Submit your running task to review status (running -> review). "
+        "Use this for code changes that need automated review before merging. "
+        "The dispatcher will spawn a review agent that checks the diff, runs "
+        "tests, and either merges your work or sends it back with change requests. "
+        "Call this INSTEAD of kanban_complete for coding tasks. Put your "
+        "structured metadata (changed_files, tests_run, diff summary) in a "
+        "kanban_comment first."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": _DESC_TASK_ID_DEFAULT,
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": [],
+    },
+}
+
 KANBAN_HEARTBEAT_SCHEMA = {
     "name": "kanban_heartbeat",
     "description": (
@@ -1425,6 +1482,15 @@ registry.register(
     handler=_handle_block,
     check_fn=_check_kanban_mode,
     emoji="⏸",
+)
+
+registry.register(
+    name="kanban_submit_review",
+    toolset="kanban",
+    schema=KANBAN_SUBMIT_REVIEW_SCHEMA,
+    handler=_handle_submit_review,
+    check_fn=_check_kanban_mode,
+    emoji="🔎",
 )
 
 registry.register(
