@@ -3094,7 +3094,7 @@ def claim_task(
             from hermes_cli.plugins import invoke_hook as _invoke_hook
             _invoke_hook(
                 "pre_kanban_dispatch",
-                task_id=task_id, run_id=run_id, task=claimed_task, db_path=None,
+                task_id=task_id, run_id=run_id, task=claimed_task, conn=conn,
             )
         except Exception:
             pass  # never let a hook failure break dispatch
