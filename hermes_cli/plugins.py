@@ -167,6 +167,12 @@ VALID_HOOKS: Set[str] = {
     #   choice: "once" | "session" | "always" | "deny" | "timeout"
     "pre_approval_request",
     "post_approval_response",
+    # Kanban re-dispatch hook. Fired by kanban_db.claim_task AFTER a task is
+    # re-claimed (run_id > 1 — a prior attempt exists), outside the write txn.
+    # Observers may annotate the task (e.g. post a comment) before the worker
+    # reads build_worker_context. Return values are ignored; failures never
+    # block the claim. Kwargs: task_id: str, run_id: int, task: Task, db_path.
+    "pre_kanban_dispatch",
 }
 
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"

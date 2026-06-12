@@ -3080,7 +3080,25 @@ def claim_task(
             {"lock": lock, "expires": expires, "run_id": run_id},
             run_id=run_id,
         )
-        return get_task(conn, task_id)
+        claimed_task = get_task(conn, task_id)
+
+    # pre_kanban_dispatch hook — fired AFTER the claim commits (outside the
+    # write txn) so a handler may inspect/annotate the task before the worker
+    # reads its context. Only fires on a RE-dispatch (run_id > 1, i.e. a prior
+    # attempt exists) so the common first-claim path is untouched and adds no
+    # overhead. Handlers are best-effort: a failing/absent hook never blocks the
+    # claim. HSCC uses this to post an idempotent-resume comment (the resume
+    # probe) that build_worker_context surfaces to the worker.
+    if run_id and run_id > 1:
+        try:
+            from hermes_cli.plugins import invoke_hook as _invoke_hook
+            _invoke_hook(
+                "pre_kanban_dispatch",
+                task_id=task_id, run_id=run_id, task=claimed_task, db_path=None,
+            )
+        except Exception:
+            pass  # never let a hook failure break dispatch
+    return claimed_task
 
 
 def claim_review_task(
