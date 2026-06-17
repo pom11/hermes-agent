@@ -646,6 +646,31 @@ class GatewayKanbanWatchersMixin:
                 else:
                     logger.info(f"kanban dispatcher: max_in_progress={max_in_progress}")
 
+        # Memory-floor safety clamp (2026-06-17 panic guard).
+        # On hosts with <64GB RAM, each kanban worker fork (Claude SDK +
+        # memori_byodb + venv) costs 6-37GB RSS; >6 concurrent saturated a
+        # 36GB Mac Studio compressor, starved watchdogd, and tripped
+        # AppleARMWatchdogTimer. Clamp to known-safe ceiling (6/2) on
+        # low-RAM hosts regardless of config. Env escape hatch:
+        # HSCC_MEM_GUARD=off disables (use only on hosts where each worker
+        # is genuinely lightweight).
+        if os.environ.get("HSCC_MEM_GUARD", "on").lower() != "off":
+            try:
+                total_mem_bytes = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+            except (OSError, ValueError):
+                total_mem_bytes = 0
+            if 0 < total_mem_bytes < 64 * 1024**3:
+                MEM_GUARD_MAX = 6
+                if max_in_progress is None or max_in_progress > MEM_GUARD_MAX:
+                    logger.warning(
+                        "kanban dispatcher: host RAM=%.1fGB <64GB; clamping "
+                        "max_in_progress=%s -> %d (HSCC_MEM_GUARD=off to disable)",
+                        total_mem_bytes / 1024**3,
+                        max_in_progress,
+                        MEM_GUARD_MAX,
+                    )
+                    max_in_progress = MEM_GUARD_MAX
+
         raw_failure_limit = kanban_cfg.get("failure_limit", _kb.DEFAULT_FAILURE_LIMIT)
         try:
             failure_limit = int(raw_failure_limit)
@@ -718,6 +743,24 @@ class GatewayKanbanWatchersMixin:
                         "kanban dispatcher: max_in_progress_per_profile=%d",
                         max_in_progress_per_profile,
                     )
+
+        # Memory-floor safety clamp (2026-06-17 panic guard) for per-profile.
+        if os.environ.get("HSCC_MEM_GUARD", "on").lower() != "off":
+            try:
+                total_mem_bytes_pp = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+            except (OSError, ValueError):
+                total_mem_bytes_pp = 0
+            if 0 < total_mem_bytes_pp < 64 * 1024**3:
+                MEM_GUARD_PP_MAX = 2
+                if max_in_progress_per_profile is None or max_in_progress_per_profile > MEM_GUARD_PP_MAX:
+                    logger.warning(
+                        "kanban dispatcher: host RAM=%.1fGB <64GB; clamping "
+                        "max_in_progress_per_profile=%s -> %d",
+                        total_mem_bytes_pp / 1024**3,
+                        max_in_progress_per_profile,
+                        MEM_GUARD_PP_MAX,
+                    )
+                    max_in_progress_per_profile = MEM_GUARD_PP_MAX
 
         # Initial delay so the gateway finishes wiring adapters before the
         # dispatcher spawns workers (those workers may hit gateway notify
