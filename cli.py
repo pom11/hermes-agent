@@ -16614,6 +16614,30 @@ def main(
                                     _exit_code = _RL_CODE
                                 except Exception:
                                     _exit_code = 1
+
+                        # Emit the session-end lifecycle event deterministically
+                        # at the worker session boundary, on BOTH the success and
+                        # failure paths. The non-goal ``-q`` branch above reaches
+                        # ``_finalize_single_query`` (→ ``_run_cleanup`` →
+                        # ``shutdown_memory_provider`` → memory providers'
+                        # ``on_session_end``) from its ``finally``.  The fully-quiet
+                        # ``-Q`` goal-mode path used to rely SOLELY on ``atexit``
+                        # firing after ``sys.exit`` below to deliver that flush.
+                        # Atexit is silently bypassed by the kanban ``os._exit(0)``
+                        # signal handler, the exit watchdog, and hard kills — each
+                        # dropping the worker's last turns before memori's
+                        # ``on_session_end`` (which joins its sync writer thread)
+                        # could ingest them. Calling the same helper here makes the
+                        # flush deterministic and exactly-once (``_run_cleanup``
+                        # dedupes via ``_cleanup_done``); ``sys.exit`` then triggers
+                        # a no-op ``atexit`` ``_run_cleanup``.
+                        try:
+                            _finalize_single_query(cli)
+                        except Exception as _fq_exc:
+                            logger.warning(
+                                "kanban worker session finalize failed (best-effort): %s",
+                                _fq_exc,
+                            )
                         sys.exit(_exit_code)
 
                 # Exit with error code if credentials or agent init fails
