@@ -153,6 +153,28 @@ def _resolve_profile_from_cfg(cfg: dict, key: str, *, fallback: Optional[str] = 
         return "default"
 
 
+def _review_policy(cfg: object) -> dict:
+    """Return the ``kanban.auto_review`` policy dict, or ``{}`` when unset.
+
+    Shape: ``{"review_roles": [...], "reviewer": "<profile>"}``. Missing or
+    malformed config returns ``{}`` so callers treat review-pairing as
+    disabled (opt-in).
+    """
+    kanban_cfg = (cfg or {}).get("kanban", {}) if isinstance(cfg, dict) else {}
+    policy = kanban_cfg.get("auto_review")
+    if not isinstance(policy, dict):
+        return {}
+    roles = policy.get("review_roles")
+    reviewer = policy.get("reviewer")
+    if not isinstance(roles, list) or not isinstance(reviewer, str):
+        return {}
+    clean_roles = [str(r).strip() for r in roles if str(r).strip()]
+    reviewer = reviewer.strip()
+    if not clean_roles or not reviewer:
+        return {}
+    return {"review_roles": clean_roles, "reviewer": reviewer}
+
+
 def _build_roster() -> tuple[list[dict], set[str]]:
     """``(roster_for_prompt, valid_assignee_names)``; entries are
     ``{name, description, has_description}``."""
