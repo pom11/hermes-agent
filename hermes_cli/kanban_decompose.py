@@ -218,6 +218,45 @@ def _load_routing(*, root_assignee: Optional[str] = None) -> _Routing:
     )
 
 
+def _pair_review_tasks(children: list[dict], policy: dict) -> list[dict]:
+    """Append a reviewer task for each impl child whose assignee is a review role.
+
+    Pure transform: takes the built ``children`` list (each a dict with
+    ``title``/``body``/``assignee``/``parents`` where parents are indices into
+    this list) and returns a NEW list with review children appended. Each
+    review child is gated behind its impl child via ``parents=[impl_index]``.
+    Review children are appended AFTER all impl children so every pre-existing
+    parent index stays valid.
+
+    Empty/None ``policy`` (or missing reviewer/roles) returns ``children``
+    unchanged. A child already assigned to the reviewer is never paired
+    (no review of a review).
+    """
+    if not policy:
+        return children
+    review_roles = set(policy.get("review_roles") or [])
+    reviewer = (policy.get("reviewer") or "").strip()
+    if not review_roles or not reviewer:
+        return children
+    out = list(children)
+    for idx, child in enumerate(children):
+        assignee = child.get("assignee")
+        if assignee == reviewer or assignee not in review_roles:
+            continue
+        out.append({
+            "title": f"review: {child.get('title', '')}".strip()[:200],
+            "body": (
+                "Review the work produced by the parent task. Read the diff for "
+                "correctness, run its tests and confirm they pass, and verify the "
+                "work matches the task spec. Approve, or send it back with precise "
+                "change requests."
+            ),
+            "assignee": reviewer,
+            "parents": [idx],
+        })
+    return out
+
+
 def _apply_single(task: kb.Task, parsed: dict, routing: _Routing, author: str) -> DecomposeOutcome:
     """``fanout=false``: single-task spec promotion (same effect as specify)."""
     title_val, body_val = _title_body(parsed)
