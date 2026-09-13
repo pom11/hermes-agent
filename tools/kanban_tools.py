@@ -380,6 +380,41 @@ def _require_text(args: dict, name: str, message: Optional[str] = None) -> Any:
 _BOOL_WORDS = {"true": True, "1": True, "yes": True, "false": False, "0": False, "no": False}
 
 
+def _default_assignee() -> Optional[str]:
+    """The configured kanban.default_assignee, or None."""
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        da = (cfg.get("kanban", {}) or {}).get("default_assignee")
+        return str(da).strip() or None if da else None
+    except Exception:
+        return None
+
+
+def _resolve_valid_assignee(assignee: str) -> tuple[str, Optional[str]]:
+    """Map a requested assignee to a real on-disk profile.
+
+    Agents sometimes pass a generic name (e.g. "worker") that is NOT a profile
+    on disk — the dispatcher silently skips such cards, stranding them in
+    ``ready`` forever. Mirror the decomposer's guarantee: if the requested
+    assignee isn't a real profile, rewrite it to kanban.default_assignee.
+    Returns (effective_assignee, note) where note is a human-readable string
+    when a rewrite happened (else None). If neither the requested name nor the
+    default resolves, returns the original (best-effort — never silently drops).
+    """
+    try:
+        from hermes_cli.profiles import profile_exists
+    except Exception:
+        return assignee, None  # can't validate — leave as-is
+    if profile_exists(assignee):
+        return assignee, None
+    default = _default_assignee()
+    if default and profile_exists(default):
+        return default, (f"assignee '{assignee}' is not a profile on disk; "
+                         f"routed to default_assignee '{default}'")
+    return assignee, None
+
+
 def _parse_bool_arg(args: dict, name: str) -> bool:
     value = args.get(name)
     if value is None or isinstance(value, bool):
@@ -1019,6 +1054,13 @@ def _handle_create(args: dict, **kw) -> str:
     assignee = args.get("assignee")
     _check(assignee, "assignee is required — name the profile that should execute this "
                      "task (the dispatcher will only spawn tasks with an assignee)")
+    # Guard against stranded cards: an assignee that is not a real on-disk
+    # profile (e.g. the generic "worker") is silently skipped by the dispatcher
+    # and sits in `ready` forever. Rewrite unknown assignees to the configured
+    # default_assignee, same guarantee the decomposer provides.
+    assignee, _assignee_note = _resolve_valid_assignee(str(assignee))
+    if _assignee_note:
+        logger.warning("kanban_create: %s", _assignee_note)
     # Workspace sharing is always explicit: omitted fields mean a fresh scratch workspace
     # even for a dispatcher-spawned creator (reusing the parent's path would let a child
     # mutate review evidence or race its checkout). Project identity is the one safe thing
