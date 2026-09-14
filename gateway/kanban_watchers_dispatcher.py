@@ -118,6 +118,36 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
     )
 
 
+def _resolve_dispatch_limits(config_loader) -> "dict[str, Optional[int]]":
+    """Resolve the live dispatch caps from current config (read fresh every tick).
+
+    Returns ``{max_spawn, max_in_progress, max_in_progress_per_profile}``.
+    ``max_spawn`` is kept raw (may be an int or, per :func:`_resolve_dispatcher_settings`,
+    an ``Any``). Fails **safe**: any config read/parse error degrades a cap to
+    ``None`` (no gate) rather than widening a value the operator lowered.
+    """
+    try:
+        cfg = config_loader()
+    except Exception:
+        cfg = {}
+    kcfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+
+    def _positive_int(value) -> "Optional[int]":
+        if value is None:
+            return None
+        try:
+            ival = int(value)
+        except (TypeError, ValueError):
+            return None
+        return ival if ival >= 1 else None
+
+    return {
+        "max_spawn": kcfg.get("max_spawn"),
+        "max_in_progress": _positive_int(kcfg.get("max_in_progress")),
+        "max_in_progress_per_profile": _positive_int(kcfg.get("max_in_progress_per_profile")),
+    }
+
+
 class _KanbanDispatcher:
     """Per-tick board work for the embedded dispatcher (runs in worker threads).
 
@@ -133,6 +163,26 @@ class _KanbanDispatcher:
         self.kb = kb
         self.settings = settings
         self.disabled_corrupt_boards: dict[str, tuple[tuple[str, int | None, int | None], float]] = {}
+
+    def _refresh_limits(self) -> None:
+        """Re-read the concurrency caps from config on EVERY dispatch tick.
+
+        The boot-time ``_resolve_dispatcher_settings`` snapshots ``max_spawn``,
+        ``max_in_progress`` and ``max_in_progress_per_profile``; without this
+        re-read a config edit left the live gateway enforcing the boot-time
+        caps while ``hermes kanban dispatch --dry-run`` (fresh config) reported
+        a different number — silent disagreement until a gateway restart.
+        Re-reading each tick (parallel to the ``auto_decompose`` live-read)
+        makes a config edit apply on the next tick. Fails safe: a transient
+        config read error returns ``None`` caps and can never widen a lowered
+        cap.
+        """
+        from hermes_cli.config import load_config
+
+        limits = _resolve_dispatch_limits(load_config)
+        self.settings.max_spawn = limits["max_spawn"]
+        self.settings.max_in_progress = limits["max_in_progress"]
+        self.settings.max_in_progress_per_profile = limits["max_in_progress_per_profile"]
 
     def _board_slugs(self) -> list:
         return _board_slugs(self.kb)
@@ -208,6 +258,7 @@ class _KanbanDispatcher:
 
     def tick_once(self) -> list[tuple[str, Optional[object]]]:
         """Run one dispatch_once per board. Returns (slug, result) pairs."""
+        self._refresh_limits()
         return [(slug, self.tick_once_for_board(slug)) for slug in self._board_slugs()]
 
     def ready_nonempty(self) -> bool:
