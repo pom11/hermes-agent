@@ -457,9 +457,34 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         )
 
 
+def _worktree_anchor(repo_root: Path) -> Path:
+    """Base directory under which a repo's linked worktrees are materialized.
+
+    Defaults to ``<repo_root>/.worktrees`` (in tree). Repos listed under
+    ``kanban.worktree.out_of_tree_repos`` in ~/.hermes/config.yaml have their root
+    treated as a build/compiler root; their worktrees are placed OUT of the tree under
+    ``kanban.worktree.out_of_tree_root/<repo-name>`` so a compiler or bundler cannot
+    walk half-finished branch code as part of the real app. ``.gitignore`` is not a
+    fix there (ignoring a path does not stop a compiler walking the filesystem) and
+    some toolchains have no exclude key (e.g. Microsoft AL), so the fix is placement.
+    """
+    from hermes_cli.config import load_config_readonly
+    cfg = ((load_config_readonly() or {}).get("kanban", {}) or {}).get("worktree") or {}
+    repos = [str(r).strip() for r in (cfg.get("out_of_tree_repos") or []) if str(r).strip()]
+    root = str(cfg.get("out_of_tree_root") or "").strip() or "~/dev/.worktrees"
+
+    def _norm(p: str) -> str:
+        return str(Path(p).expanduser().resolve(strict=False))
+
+    repo_key = _norm(str(repo_root))
+    if any(repo_key == _norm(r) for r in repos):
+        return Path(_norm(root)) / repo_root.name
+    return repo_root / ".worktrees"
+
+
 def _anchored_worktree(repo_root: Path, task_id: str, branch_name: str) -> tuple[Path, str]:
-    """Materialize the canonical ``<repo>/.worktrees/<task-id>`` worktree."""
-    target = repo_root / ".worktrees" / task_id
+    """Materialize the canonical worktree for a task under the repo's anchor."""
+    target = _worktree_anchor(repo_root) / task_id
     _ensure_git_worktree(repo_root, target, branch_name)
     return target, branch_name
 
@@ -514,7 +539,7 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
         # unsafe under concurrency — so fall back to our own worktree.
         fallback_root = _repo_root_for_worktree_target(requested.parent)
         if fallback_root is not None:
-            fallback = fallback_root / ".worktrees" / task.id
+            fallback = _worktree_anchor(fallback_root) / task.id
             if _path_key(fallback.resolve(strict=False)) != _path_key(requested_resolved):
                 _ensure_git_worktree(fallback_root, fallback, branch_name)
                 return fallback.resolve(strict=False), branch_name

@@ -129,5 +129,73 @@ def test_resolve_worktree_falls_back_when_path_occupied(kanban_home, tmp_path):
     assert head == "wt/sibling"
 
 
+def test_worktree_anchor_out_of_tree_for_registered_repo(kanban_home, tmp_path, monkeypatch):
+    """Repos listed under kanban.worktree.out_of_tree_repos get their worktrees
+    placed OUT of the tree (under out_of_tree_root/<repo-name>), so a compiler or
+    bundler rooted at the project root never walks branch code. Repos not listed
+    keep the in-tree ``<repo>/.worktrees`` default."""
+    repo = _make_repo(tmp_path)
+    out_root = tmp_path / "out-of-tree"
+
+    def _cfg(repos):
+        return {
+            "kanban": {
+                "worktree": {
+                    "out_of_tree_repos": repos,
+                    "out_of_tree_root": str(out_root),
+                }
+            }
+        }
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: _cfg([str(repo)]),
+    )
+    # Registered repo → out of tree.
+    assert kbw._worktree_anchor(repo) == (out_root / repo.name).resolve()
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: _cfg([]),
+    )
+    # Not registered → in-tree .worktrees default.
+    assert kbw._worktree_anchor(repo) == (repo / ".worktrees").resolve()
+
+
+def test_resolve_worktree_places_registered_repo_out_of_tree(kanban_home, tmp_path, monkeypatch):
+    """End-to-end: a worktree-kind task on an out-of-tree-registered repo is
+    materialized under ``<out_of_tree_root>/<repo-name>/<task-id>``, not inside
+    the project root."""
+    repo = _make_repo(tmp_path)
+    out_root = tmp_path / "out-of-tree"
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {
+            "kanban": {
+                "worktree": {
+                    "out_of_tree_repos": [str(repo)],
+                    "out_of_tree_root": str(out_root),
+                }
+            }
+        },
+    )
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="task on a compiler-root repo",
+            workspace_kind="worktree",
+            workspace_path=str(repo),  # anchor = repo root
+        )
+        task = kb.get_task(conn, tid)
+
+    workspace, branch = kbw._resolve_worktree_workspace(task)
+    assert workspace == (out_root / repo.name / tid).resolve()
+    assert branch == f"wt/{tid}"
+    # The project root itself must NOT contain the worktree.
+    assert not (repo / ".worktrees").exists()
+    assert (workspace / "README.md").exists()
+
+
 
 
