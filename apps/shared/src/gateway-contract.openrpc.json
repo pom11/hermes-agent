@@ -3049,6 +3049,24 @@
       }
     },
     {
+      "name": "session.complete_handoff",
+      "summary": "Controller takes over a session lease after the owner consents (one-shot nonce).",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/SessionCompleteHandoffParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SessionCompleteHandoffResult"
+        }
+      }
+    },
+    {
       "name": "session.compress",
       "summary": "Manual /compress of an idle session, optionally focused on a topic.",
       "params": [
@@ -3265,6 +3283,24 @@
       }
     },
     {
+      "name": "session.handoff_consent",
+      "summary": "Owner approves a pending authorized-controller handoff for this session; returns the one-shot nonce.",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/SessionHandoffConsentParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SessionHandoffConsentResult"
+        }
+      }
+    },
+    {
       "name": "session.history",
       "summary": "The durable display transcript (ancestors included, row ids attached).",
       "params": [
@@ -3351,6 +3387,24 @@
         "name": "result",
         "schema": {
           "$ref": "#/components/schemas/SessionCorrectionResult"
+        }
+      }
+    },
+    {
+      "name": "session.request_handoff",
+      "summary": "Controller records a pending consent ask to take over a session a live owner holds.",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/SessionRequestHandoffParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SessionRequestHandoffResult"
         }
       }
     },
@@ -27949,6 +28003,61 @@
         "title": "SessionCloseResult",
         "type": "object"
       },
+      "SessionCompleteHandoffParams": {
+        "additionalProperties": false,
+        "description": "Controller completes a GRANTED handoff with the one-shot nonce the owner's consent returned.\nFail-closed: wrong/absent nonce or a non-owner caller completes nothing. Pass your own session\nid (from ``session.resume``); the handler resolves the stored key and attaches the lease to\nyour session record so the next ``prompt.submit`` succeeds.",
+        "properties": {
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "profile": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Profile"
+          },
+          "controller": {
+            "title": "Controller",
+            "type": "string"
+          },
+          "nonce": {
+            "title": "Nonce",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "controller",
+          "nonce"
+        ],
+        "title": "SessionCompleteHandoffParams",
+        "type": "object"
+      },
+      "SessionCompleteHandoffResult": {
+        "additionalProperties": false,
+        "description": "``completed`` True means the lease moved to this process; ``pending`` True means the owner\nhas not yet consented (call ``session.request_handoff`` first).",
+        "properties": {
+          "completed": {
+            "default": false,
+            "title": "Completed",
+            "type": "boolean"
+          },
+          "pending": {
+            "default": false,
+            "title": "Pending",
+            "type": "boolean"
+          }
+        },
+        "title": "SessionCompleteHandoffResult",
+        "type": "object"
+      },
       "SessionCompressParams": {
         "additionalProperties": false,
         "properties": {
@@ -29423,6 +29532,56 @@
         "title": "SessionForeignPreviewResult",
         "type": "object"
       },
+      "SessionHandoffConsentParams": {
+        "additionalProperties": false,
+        "description": "Owner consent to a pending authorized-controller handoff. Only the OWNER of the session\n(the client whose live session id matches the registry lease) may grant; the handler proves\nsame-writer identity (pid + live_session_id) before minting the one-shot nonce.",
+        "properties": {
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "profile": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Profile"
+          },
+          "controller": {
+            "title": "Controller",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "controller"
+        ],
+        "title": "SessionHandoffConsentParams",
+        "type": "object"
+      },
+      "SessionHandoffConsentResult": {
+        "additionalProperties": false,
+        "description": "The one-shot nonce the named controller must present to complete the handoff, or empty\nwhen there was no pending request / the caller is not the owner (denied).",
+        "properties": {
+          "nonce": {
+            "default": "",
+            "title": "Nonce",
+            "type": "string"
+          },
+          "granted": {
+            "default": false,
+            "title": "Granted",
+            "type": "boolean"
+          }
+        },
+        "title": "SessionHandoffConsentResult",
+        "type": "object"
+      },
       "SessionHistoryParams": {
         "additionalProperties": false,
         "properties": {
@@ -30049,6 +30208,56 @@
           "reason"
         ],
         "title": "SessionReclaimedPayload",
+        "type": "object"
+      },
+      "SessionRequestHandoffParams": {
+        "additionalProperties": false,
+        "description": "Controller asks to drive a session a live foreign owner holds. Pass your own session id\n(the one ``session.resume`` returned) -- the handler resolves the STORED session key from it.\nNothing transfers here; the ask is recorded on the owner's registry entry for consent.",
+        "properties": {
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "profile": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Profile"
+          },
+          "controller": {
+            "title": "Controller",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "controller"
+        ],
+        "title": "SessionRequestHandoffParams",
+        "type": "object"
+      },
+      "SessionRequestHandoffResult": {
+        "additionalProperties": false,
+        "description": "``pending`` True means the owner has not yet consented (await ``session.complete_handoff``);\n``granted`` True means the owner ALREADY consented to this controller (complete immediately).",
+        "properties": {
+          "pending": {
+            "default": true,
+            "title": "Pending",
+            "type": "boolean"
+          },
+          "granted": {
+            "default": false,
+            "title": "Granted",
+            "type": "boolean"
+          }
+        },
+        "title": "SessionRequestHandoffResult",
         "type": "object"
       },
       "SessionResumeParams": {

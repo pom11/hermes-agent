@@ -3338,6 +3338,40 @@ export interface LlmOneshotParams {
 export interface LlmOneshotResult {
   text: string
 }
+/** Owner consent to a pending authorized-controller handoff. Only the OWNER of the session (the client whose live session id matches the registry lease) may grant; the handler proves same-writer identity (pid + live_session_id) before minting the one-shot nonce. */
+export interface SessionHandoffConsentParams {
+  session_id: string
+  profile?: string | null
+  controller: string
+}
+/** The one-shot nonce the named controller must present to complete the handoff, or empty when there was no pending request / the caller is not the owner (denied). */
+export interface SessionHandoffConsentResult {
+  nonce?: string
+  granted?: boolean
+}
+/** Controller asks to drive a session a live foreign owner holds. Pass your own session id (the one ``session.resume`` returned) -- the handler resolves the STORED session key from it. Nothing transfers here; the ask is recorded on the owner's registry entry for consent. */
+export interface SessionRequestHandoffParams {
+  session_id: string
+  profile?: string | null
+  controller: string
+}
+/** ``pending`` True means the owner has not yet consented (await ``session.complete_handoff``); ``granted`` True means the owner ALREADY consented to this controller (complete immediately). */
+export interface SessionRequestHandoffResult {
+  pending?: boolean
+  granted?: boolean
+}
+/** Controller completes a GRANTED handoff with the one-shot nonce the owner's consent returned. Fail-closed: wrong/absent nonce or a non-owner caller completes nothing. Pass your own session id (from ``session.resume``); the handler resolves the stored key and attaches the lease to your session record so the next ``prompt.submit`` succeeds. */
+export interface SessionCompleteHandoffParams {
+  session_id: string
+  profile?: string | null
+  controller: string
+  nonce: string
+}
+/** ``completed`` True means the lease moved to this process; ``pending`` True means the owner has not yet consented (call ``session.request_handoff`` first). */
+export interface SessionCompleteHandoffResult {
+  completed?: boolean
+  pending?: boolean
+}
 export interface SystemBatteryParams {
   profile?: string | null
 }
@@ -5006,6 +5040,8 @@ export interface RpcMethods {
   'session.branch_whole': { params: SessionBranchWholeParams; result: SessionBranchWholeResult }
   /** Tear down a live session (its stored row stays resumable). */
   'session.close': { params: SessionCloseParams; result: SessionCloseResult }
+  /** Controller takes over a session lease after the owner consents (one-shot nonce). */
+  'session.complete_handoff': { params: SessionCompleteHandoffParams; result: SessionCompleteHandoffResult }
   /** Manual /compress of an idle session, optionally focused on a topic. */
   'session.compress': { params: SessionCompressParams; result: SessionCompressResult }
   /** Cursor-style split of the context window by category. */
@@ -5030,6 +5066,8 @@ export interface RpcMethods {
   'session.foreign.list': { params: SessionForeignListParams; result: SessionForeignListResult }
   /** Preview a foreign session's tail before importing it. */
   'session.foreign.preview': { params: SessionForeignIdParams; result: SessionForeignPreviewResult }
+  /** Owner approves a pending authorized-controller handoff for this session; returns the one-shot nonce. */
+  'session.handoff_consent': { params: SessionHandoffConsentParams; result: SessionHandoffConsentResult }
   /** The durable display transcript (ancestors included, row ids attached). */
   'session.history': { params: SessionHistoryParams; result: SessionHistoryResult }
   /** Stop the running turn (and streaming TTS); retires the crash-recovery marker. */
@@ -5040,6 +5078,8 @@ export interface RpcMethods {
   'session.most_recent': { params: SessionMostRecentParams; result: SessionMostRecentResult }
   /** Redirect the active turn (queued for the next turn while the agent is still building). */
   'session.redirect': { params: SessionCorrectionParams; result: SessionCorrectionResult }
+  /** Controller records a pending consent ask to take over a session a live owner holds. */
+  'session.request_handoff': { params: SessionRequestHandoffParams; result: SessionRequestHandoffResult }
   /** Attach to a stored session: reuse it if live here, else lazy / deferred / cold / eager rebuild. */
   'session.resume': { params: SessionResumeParams; result: SessionResumeResult }
   /** Export the transcript to ~/.hermes/sessions/saved (classic /save). */
@@ -5314,6 +5354,7 @@ export const RPC_METHODS = [
   'session.branch_stored',
   'session.branch_whole',
   'session.close',
+  'session.complete_handoff',
   'session.compress',
   'session.context_breakdown',
   'session.control',
@@ -5326,11 +5367,13 @@ export const RPC_METHODS = [
   'session.foreign.import',
   'session.foreign.list',
   'session.foreign.preview',
+  'session.handoff_consent',
   'session.history',
   'session.interrupt',
   'session.list',
   'session.most_recent',
   'session.redirect',
+  'session.request_handoff',
   'session.resume',
   'session.save',
   'session.set_hidden',

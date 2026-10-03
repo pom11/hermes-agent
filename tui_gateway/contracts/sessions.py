@@ -728,3 +728,71 @@ class LlmOneshotResult(Result):
 
 method("llm.oneshot", params=LlmOneshotParams, result=LlmOneshotResult,
        doc="Stateless one-shot LLM completion (titles, ideas) on the session's or the task backend.")
+
+
+# ── authorized-controller session handoff consent ───────────────────────────────────────────
+
+
+class SessionHandoffConsentParams(SessionParams):
+    """Owner consent to a pending authorized-controller handoff. Only the OWNER of the session
+    (the client whose live session id matches the registry lease) may grant; the handler proves
+    same-writer identity (pid + live_session_id) before minting the one-shot nonce."""
+
+    controller: str
+
+
+class SessionHandoffConsentResult(Result):
+    """The one-shot nonce the named controller must present to complete the handoff, or empty
+    when there was no pending request / the caller is not the owner (denied)."""
+
+    nonce: str = ""
+    granted: bool = False
+
+
+method("session.handoff_consent", params=SessionHandoffConsentParams,
+       result=SessionHandoffConsentResult,
+       doc="Owner approves a pending authorized-controller handoff for this session; returns the one-shot nonce.")
+
+
+class SessionRequestHandoffParams(SessionParams):
+    """Controller asks to drive a session a live foreign owner holds. Pass your own session id
+    (the one ``session.resume`` returned) -- the handler resolves the STORED session key from it.
+    Nothing transfers here; the ask is recorded on the owner's registry entry for consent."""
+
+    controller: str
+
+
+class SessionRequestHandoffResult(Result):
+    """``pending`` True means the owner has not yet consented (await ``session.complete_handoff``);
+    ``granted`` True means the owner ALREADY consented to this controller (complete immediately)."""
+
+    pending: bool = True
+    granted: bool = False
+
+
+method("session.request_handoff", params=SessionRequestHandoffParams,
+       result=SessionRequestHandoffResult,
+       doc="Controller records a pending consent ask to take over a session a live owner holds.")
+
+
+class SessionCompleteHandoffParams(SessionParams):
+    """Controller completes a GRANTED handoff with the one-shot nonce the owner's consent returned.
+    Fail-closed: wrong/absent nonce or a non-owner caller completes nothing. Pass your own session
+    id (from ``session.resume``); the handler resolves the stored key and attaches the lease to
+    your session record so the next ``prompt.submit`` succeeds."""
+
+    controller: str
+    nonce: str
+
+
+class SessionCompleteHandoffResult(Result):
+    """``completed`` True means the lease moved to this process; ``pending`` True means the owner
+    has not yet consented (call ``session.request_handoff`` first)."""
+
+    completed: bool = False
+    pending: bool = False
+
+
+method("session.complete_handoff", params=SessionCompleteHandoffParams,
+       result=SessionCompleteHandoffResult,
+       doc="Controller takes over a session lease after the owner consents (one-shot nonce).")

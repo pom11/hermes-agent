@@ -1262,6 +1262,131 @@ def _(rid, params: dict) -> dict:
     return _ok(rid, {"failed": bool(failed), "state": state})
 
 
+# ── authorized-controller handoff consent ─────────────────────────────────
+@method("session.handoff_consent")
+def _(rid, params: dict) -> dict:
+    """Owner approves a pending authorized-controller handoff for this session.
+
+    Called by the OWNER's client (the interactive CLI / desktop window that holds the
+    session) to answer a ``session.handoff`` consent ask: "App name wants to take over
+    session X -- Allow / Always / Deny". Grants by proving same-writer identity
+    against the registry (pid + live_session_id: the caller's sid IS the live id the
+    lease was acquired with), then returns the ONE-SHOT nonce the controller presents
+    to complete the transfer. Nothing transfers here -- the controller still has to
+    complete. ``granted=False`` (nonce empty) means there was no pending request from
+    that controller or the caller is not the owner; the handoff does not happen.
+    """
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    sid = str(params.get("session_id") or "")
+    controller = str(params.get("controller") or "").strip()
+    if not controller:
+        return _err(rid, 4023, "controller required")
+    key = str(session.get("session_key") or "")
+    if not key:
+        return _err(rid, 4028, "session has no stored key to hand off")
+    try:
+        from hermes_cli.active_sessions import grant_active_session_handoff
+        nonce = grant_active_session_handoff(
+            key, controller=controller, live_session_id=sid,
+        )
+    except Exception as exc:
+        logger.warning("session.handoff_consent grant failed: %s", exc)
+        nonce = None
+    if not nonce:
+        return _ok(rid, {"nonce": "", "granted": False})
+    return _ok(rid, {"nonce": nonce, "granted": True})
+
+
+# ── authorized-controller request + complete ───────────────────────────
+@method("session.request_handoff")
+def _(rid, params: dict) -> dict:
+    """Controller asks to drive a session that a live foreign owner currently holds.
+
+    Called by the CONTROLLER's client (the HSCC serve bridge / ACP server) against its own
+    resumed session record to record a pending consent ask on the owner's registry entry. The
+    owner sees it on THIS session's tile in its window. Returns ``pending`` so the caller can
+    show "waiting for approval on your computer" (SESSION_HANDOFF_PENDING is a wait, not a
+    hard deny -- the refused submit surfaces that reason). ``granted`` True means the owner has
+    ALREADY consented to this controller (the ask is moot; the caller may complete directly).
+
+    Exclusivity is never bypassed here: nothing transfers on request -- only the OWNER's
+    ``session.handoff_consent`` grants, and only the controller's ``session.complete_handoff``
+    with that grant's one-shot nonce moves the lease.
+    """
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    key = str(session.get("session_key") or "")
+    if not key:
+        return _err(rid, 4028, "session has no stored key to hand off")
+    controller = str(params.get("controller") or "").strip()
+    if not controller:
+        return _err(rid, 4023, "controller required")
+    try:
+        from hermes_cli.active_sessions import request_active_session_handoff
+        pending, request_err = request_active_session_handoff(
+            key, controller=controller, registry_home=session.get("profile_home"))
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("session.request_handoff failed: %s", exc)
+        return _err(rid, 4000, "handoff request failed")
+    if request_err is not None:
+        return _err(rid, 4000, f"handoff request refused: {request_err}")
+    granted = bool((pending or {}).get("granted"))
+    return _ok(rid, {"pending": not granted, "granted": granted})
+
+
+@method("session.complete_handoff")
+def _(rid, params: dict) -> dict:
+    """Controller completes a GRANTED handoff: takes over the session lease and drives the turn.
+
+    Called by the CONTROLLER's client with the one-shot nonce returned by the OWNER's
+    ``session.handoff_consent``. Verifies controller identity + nonce against the registry
+    (fail-closed: wrong/absent nonce or a non-owner caller completes nothing), transfers the
+    lease to this process, and attaches it to the caller's session record. The very next
+    ``prompt.submit`` on this session then succeeds because this process now owns the lease
+    (the submit path's ``_ensure_active_session_slot`` sees a live lease and proceeds).
+
+    Returns ``completed: true`` on success; ``pending: true, completed: false`` when the owner
+    has not yet consented (call ``session.request_handoff`` first); an error otherwise.
+    """
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    sid = str(params.get("session_id") or "")
+    key = str(session.get("session_key") or "")
+    if not key:
+        return _err(rid, 4028, "session has no stored key to hand off")
+    controller = str(params.get("controller") or "").strip()
+    nonce = str(params.get("nonce") or "").strip()
+    if not controller or not nonce:
+        return _err(rid, 4023, "controller and nonce required")
+    try:
+        from hermes_cli.active_sessions import (
+            SESSION_HANDOFF_PENDING, SESSION_NOT_OWNED, ActiveSessionRefusal,
+            complete_active_session_handoff,
+        )
+        from .session_lifecycle import _attach_lease, _lease_metadata
+        surface = str(session.get("source") or session.get("surface") or "desktop")
+        completed, refusal = complete_active_session_handoff(
+            key, controller=controller, nonce=nonce, surface=surface,
+            metadata=_lease_metadata(sid) if sid else None,
+            registry_home=session.get("profile_home"),
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("session.complete_handoff failed: %s", exc)
+        return _err(rid, 4000, "handoff completion failed")
+    if completed is not None:
+        _attach_lease(session, completed)
+        return _ok(rid, {"completed": True, "pending": False})
+    if refusal is not None and getattr(refusal, "reason", None) == SESSION_HANDOFF_PENDING:
+        return _ok(rid, {"completed": False, "pending": True})
+    if refusal is not None and getattr(refusal, "reason", None) == SESSION_NOT_OWNED:
+        return _err(rid, 4090, f"session {key} is still owned by another process", SESSION_NOT_OWNED)
+    return _err(rid, 4000, "handoff completion refused")
+
+
 # ── usage ────────────────────────────────────────────────────────────
 @_session_method("session.usage")
 def _(rid, params: dict, session: dict) -> dict:
