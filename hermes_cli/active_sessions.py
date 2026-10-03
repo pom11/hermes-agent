@@ -12,6 +12,7 @@ import logging
 import collections
 import math
 import os
+import secrets
 import time
 import uuid
 from contextlib import contextmanager, suppress
@@ -102,6 +103,14 @@ def active_session_limit_message(
 # people). Capacity = "busy, come back later"; ownership = "a live owner exists and
 # writing would interleave with theirs".
 SESSION_NOT_OWNED = "SESSION_NOT_OWNED"
+# A consented handoff of the session to an authorized controller is outstanding: the
+# owner has been asked and the lease is NOT yet transferred. Distinct from
+# SESSION_NOT_OWNED on purpose -- a hard "someone else owns this" (no handoff requested)
+# and "the owner is deciding whether to hand it over" call for different client UX (the
+# app should show "waiting for approval on your computer", not "this chat is open
+# elsewhere"). The controller retries once the owner consents; the request is keyed to
+# (session, controller), so a deny or expiry is just the absence of a pending request.
+SESSION_HANDOFF_PENDING = "SESSION_HANDOFF_PENDING"
 MAX_CONCURRENT_SESSIONS = "MAX_CONCURRENT_SESSIONS"
 # Ownership could not be PROVEN (registry unreadable/corrupt). Deliberately distinct
 # from SESSION_NOT_OWNED: treating "can't tell" as a go-ahead is the fail-open hole
@@ -635,6 +644,261 @@ def transfer_active_session(
         _write_entries(state_path, entries)
         lease.session_id = new_session_id
         return True
+
+
+# ---------------------------------------------------------------------------
+# Consented authorized-controller handoff ("remote control")
+#
+# Exclusivity is a CORRECTNESS guarantee (see the docstring on
+# try_acquire_active_session): at most one live owner per stored session, enforced
+# unconditionally. The handoff below does NOT weaken that fence -- it is a CONSENTED
+# transfer, the same ``transfer_active_session`` move the detached-sibling takeover
+# already uses, but extended to a LIVE FOREIGN owner (the interactive CLI in another
+# process, which `_take_over_detached_runtime_lease` deliberately leaves untouched:
+# #100029). The owner grants consent against its own client, so a controller can never
+# silently bypass the fence.
+#
+# Protocol (all three steps coordinate through the shared registry file):
+#   1. controller  -> request_active_session_handoff(session, controller)
+#                       stamps a pending request on the owner's entry, returns the
+#                       owner's identity so the controller can route the consent ask.
+#   2. owner       -> grant_active_session_handoff(session, controller, lease)
+#                       the OWNER (proven same-writer by pid + live_session_id via its
+#                       lease) marks the request granted with a ONE-SHOT nonce and
+#                       returns the nonce. The owner's server surfaces the consent
+#                       prompt to its client ("Allow for one turn / Always / Deny").
+#   3. controller  -> complete_active_session_handoff(session, controller, nonce, ...)
+#                       presents the nonce; the lease is moved to the controller and a
+#                       new controller lease is returned. The nonce is consumed.
+#
+# A handoff request is scoped to (session, controller) and expires after
+# ``_HANDOFF_TTL_SECONDS``; a deny/expiry is simply the absence of a pending request,
+# so a later request is a fresh ask. Safety: only a genuine same-writer owner (the
+# process that holds the lease, same pid + live_session_id) can GRANT -- a controller
+# can never self-approve; and only the named controller with the matching one-shot
+# nonce can COMPLETE -- a third party cannot ride a consent meant for someone else.
+_HANDOFF_TTL_SECONDS = 300.0
+
+
+def _controller_id(controller: Any) -> str:
+    """Normalize a controller identity to a non-empty string, or \"\" when absent."""
+    if isinstance(controller, str):
+        return controller.strip()
+    if isinstance(controller, dict) and isinstance(controller.get("id"), str):
+        return controller["id"].strip()
+    return ""
+
+
+def _handoff_stamp(controller: str) -> dict:
+    return {"controller": controller, "requested_at": time.time(),
+            "granted": False, "nonce": None}
+
+
+def _owner_handoff_payload(owner: dict) -> dict:
+    """Controller-safe summary of who owns the session, for routing the consent ask."""
+    payload = {
+        "surface": str(owner.get("surface") or ""),
+        "pid": owner.get("pid"),
+        "started_at": owner.get("started_at"),
+    }
+    # The live_session_id is the owner's client identity, not a secret, but it is only
+    # useful to a peer that shares this process's _sessions registry -- a foreign
+    # controller cannot address the owner's client by it. Expose it anyway (harmless,
+    # and a same-process peer such as the dashboard pool can use it to send the ask).
+    metadata = owner.get("metadata")
+    if isinstance(metadata, dict) and metadata.get("live_session_id"):
+        payload["live_session_id"] = metadata["live_session_id"]
+    return payload
+
+
+def request_active_session_handoff(
+    session_id: str, *, controller: Any, registry_home: str | Path | None = None,
+) -> tuple[Optional[dict], Optional[str]]:
+    """Controller requests the live owner's lease for ``session_id`` (consent outstanding).
+
+    Returns ``(None, ActiveSessionRefusal)`` when there is no live owner to hand off
+    (the caller should surface that plainly) or the controller identity is blank/opaque.
+    Otherwise returns ``({"granted": bool, "owner": {...}}, None)`` -- ``granted`` False
+    means a pending ask is now stamped on the owner's entry and the controller should
+    surface "waiting for approval on your computer"; True means this controller already
+    has a granted (unused) nonce from an earlier round-trip and may complete immediately.
+
+    The request is stamped onto the OWNER's registry entry under the same file lock that
+    enforces exclusivity, so it cannot race a takeover/transfer out from under us: an
+    entry that no longer holds the session has no live owner to ask and yields None.
+    """
+    key = str(session_id or "")
+    controller = _controller_id(controller)
+    if not key or not controller:
+        return None, ActiveSessionRefusal(
+            "A session handoff needs both a stored session id and a named controller.",
+            SESSION_COORDINATION_UNAVAILABLE,
+        )
+    state_path, lock_path = _lease_paths(registry_home=registry_home)
+    with _FileLock(lock_path):
+        loaded = _read_live_entries(
+            state_path, track_liveness=False,
+            warn="Active-session registry is unavailable; cannot record a handoff request",
+            target_session_id=key,
+        )
+        if loaded is None:
+            return None, ActiveSessionRefusal(
+                "Hermes could not read the active-session registry, so it cannot "
+                "ask the current owner to hand over the session.",
+                SESSION_COORDINATION_UNAVAILABLE,
+            )
+        entries = loaded[1]
+        owner = next((e for e in entries if str(e.get("session_id") or "") == key), None)
+        if owner is None:
+            return None, ActiveSessionRefusal(
+                f"No live Hermes process currently owns session {key}; nothing to hand off.",
+                SESSION_NOT_OWNED,
+            )
+        now = time.time()
+        existing = owner.get("handoff")
+        if isinstance(existing, dict) and str(existing.get("controller") or "") == controller:
+            if existing.get("granted") and existing.get("nonce"):
+                return {"granted": True, "owner": _owner_handoff_payload(owner)}, None
+            if (existing.get("requested_at") or 0.0) > now - _HANDOFF_TTL_SECONDS:
+                return {"granted": False, "owner": _owner_handoff_payload(owner)}, None
+        owner["handoff"] = _handoff_stamp(controller)
+        owner["updated_at"] = now
+        _write_entries(state_path, entries)
+        logger.info("Active session %s: handoff requested by controller %r", key, controller)
+        return {"granted": False, "owner": _owner_handoff_payload(owner)}, None
+
+
+def grant_active_session_handoff(
+    session_id: str, *, controller: Any, live_session_id: str,
+) -> Optional[str]:
+    """OWNER consents: mark the controller's pending request granted; return the nonce.
+
+    Only a genuine same-writer owner -- the process that holds the lease, identified by
+    (pid, live_session_id) against the registry entry -- may grant. ``live_session_id``
+    is the owner's own live session id (its ``sid``), which only the owner's process
+    knows; a controller can never self-approve because it cannot name the owner's live
+    id. Returns the ONE-SHOT nonce the controller must present to
+    ``complete_active_session_handoff``, or None when there is no pending request for
+    this controller, the caller is not the owner, or the registry is unreadable (fail
+    closed).
+    """
+    key = str(session_id or "")
+    controller = _controller_id(controller)
+    if not key or not controller or not (live_session_id or "").strip():
+        return None
+    home = Path(get_hermes_home())
+    state_path, lock_path = _lease_paths(registry_home=home)
+    with _FileLock(lock_path):
+        loaded = _read_live_entries(
+            state_path, track_liveness=False,
+            warn="Active-session registry is unavailable; refusing to grant a handoff",
+            target_session_id=key,
+        )
+        if loaded is None:
+            return None
+        entries = loaded[1]
+        owner = next((e for e in entries if str(e.get("session_id") or "") == key), None)
+        if owner is None:
+            return None
+        # The consenting process must BE the owner: same pid AND same live_session_id.
+        if not _is_same_writer(owner, {"live_session_id": live_session_id}):
+            logger.info(
+                "Active session %s: handoff grant refused -- caller is not the owner",
+                key)
+            return None
+        h = owner.get("handoff")
+        if not isinstance(h, dict) or str(h.get("controller") or "") != controller:
+            return None
+        nonce = secrets.token_urlsafe(24)
+        owner["handoff"] = {"controller": controller, "requested_at": h.get("requested_at") or time.time(),
+                            "granted": True, "nonce": nonce}
+        owner["updated_at"] = time.time()
+        _write_entries(state_path, entries)
+        logger.info("Active session %s: owner consented to handoff to controller %r", key, controller)
+        return nonce
+
+
+def complete_active_session_handoff(
+    session_id: str, *, controller: Any, nonce: str, surface: str,
+    metadata: Optional[dict[str, Any]] = None, registry_home: str | Path | None = None,
+) -> tuple[Optional[ActiveSessionLease], Optional[str]]:
+    """Controller presents the one-shot nonce and takes the lease; returns its new lease.
+
+    ``(lease, None)`` on success -- the caller owns the session and may drive its turn.
+    ``(None, ActiveSessionRefusal)`` on failure, with the reason typed: a wrong/absent
+    nonce, no pending granted request for this controller, or a registry that became
+    unreadable all refuse; none of them transfer anything. The nonce is one-shot -- a
+    completed handoff clears the handoff record, so a replay of the same nonce is
+    refused. The transfer reuses the same registry move ``transfer_active_session``
+    performs (the owner's entry becomes the controller's under one lock), so exclusivity
+    is preserved: exactly one live owner before and after.
+    """
+    key = str(session_id or "")
+    controller = _controller_id(controller)
+    if not key or not controller or not (nonce or "").strip():
+        return None, ActiveSessionRefusal(
+            "A session handoff completion needs a session id, a named controller, and the owner's consent nonce.",
+            SESSION_COORDINATION_UNAVAILABLE,
+        )
+    state_path, lock_path = _lease_paths(registry_home=registry_home)
+    with _FileLock(lock_path):
+        loaded = _read_live_entries(
+            state_path, track_liveness=False,
+            warn="Active-session registry is unavailable; refusing to complete a handoff",
+            target_session_id=key,
+        )
+        if loaded is None:
+            return None, ActiveSessionRefusal(
+                "Hermes could not read the active-session registry, so it cannot complete the handoff.",
+                SESSION_COORDINATION_UNAVAILABLE,
+            )
+        entries = loaded[1]
+        owner = next((e for e in entries if str(e.get("session_id") or "") == key), None)
+        if owner is None:
+            return None, ActiveSessionRefusal(
+                f"No live process owns session {key}; nothing to hand off.", SESSION_NOT_OWNED)
+        h = owner.get("handoff")
+        if not (isinstance(h, dict) and str(h.get("controller") or "") == controller
+                and h.get("granted") and h.get("nonce") == nonce):
+            return None, ActiveSessionRefusal(
+                f"Session {key} has no valid consented handoff for controller {controller!r}; "
+                "ask the owner to approve a fresh handoff request.",
+                SESSION_NOT_OWNED,
+            )
+        if (h.get("requested_at") or 0.0) <= time.time() - _HANDOFF_TTL_SECONDS:
+            owner.pop("handoff", None)
+            owner["updated_at"] = time.time()
+            _write_entries(state_path, entries)
+            return None, ActiveSessionRefusal(
+                f"The handoff consent for session {key} expired; ask the owner again.",
+                SESSION_HANDOFF_PENDING,
+            )
+        # Consume the consent and move the lease. The controller's entry replaces the
+        # owner's under one lock, so exclusivity is preserved: exactly one live owner.
+        # The controller takes a FRESH lease_id, so no stale owner-side object -- an old
+        # ``ActiveSessionLease`` still attached to the owner's session record -- can ever
+        # release/transfer the controller's entry: ``release()``/``transfer()`` look
+        # entries up by lease_id, and the controller's id is one only it knows. The
+        # owner's orphan sweep (`_own_live_lease_ids`) cannot drop it either: that sweep
+        # only removes entries carrying THIS process's pid, and the entry now carries the
+        # controller's. Ownership is a transfer, not a shared handle.
+        controller_entry = _lease_entry(
+            lease_id=uuid.uuid4().hex, session_id=key, surface=str(surface),
+            metadata=metadata, track_liveness=bool(owner.get("track_liveness")),
+        )
+        controller_entry["started_at"] = owner.get("started_at")
+        entries = [e for e in entries if e is not owner]
+        entries.insert(0, controller_entry)
+        _write_entries(state_path, entries)
+        lease = ActiveSessionLease(
+            lease_id=str(controller_entry["lease_id"]), session_id=key, surface=str(surface),
+            state_path=state_path, lock_path=lock_path,
+            track_liveness=bool(owner.get("track_liveness")),
+        )
+        logger.info(
+            "Active session %s: lease handed off to controller %r (surface=%s)",
+            key, controller, surface)
+        return lease, None
 
 
 # A lease this process wrote in the last few seconds may not be in the caller's
