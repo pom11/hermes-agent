@@ -45,3 +45,16 @@ def _fast_retry_backoff(request, monkeypatch):
     # server-error retries don't burn real wall-clock seconds.
     from agent import retry_utils as _retry_utils
     monkeypatch.setattr(_retry_utils, "jittered_backoff", lambda *a, **k: 0.0)
+
+
+@pytest.fixture(autouse=True)
+def _fast_stale_retry_jitter(request, monkeypatch):
+    """Short-circuit the 30-60s post-stale-kill retry wait for this directory.
+
+    Tests that assert the wait itself opt out with
+    ``@pytest.mark.real_stale_retry_jitter``.
+    """
+    if request.node.get_closest_marker("real_stale_retry_jitter"):
+        return
+    from agent import chat_completion_helpers as _helpers
+    monkeypatch.setattr(_helpers, "_interruptible_stale_retry_wait", lambda *a, **k: True)

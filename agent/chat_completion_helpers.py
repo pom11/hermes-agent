@@ -15,6 +15,7 @@ import json
 import logging
 import math
 import os
+import random
 import re
 import threading
 import time
@@ -54,6 +55,11 @@ _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
 _PROVIDER_STREAM_ERROR_FINISH_REASONS = {"error", "error_finish"}
 _PROVIDER_STREAM_SSE_FIELDS = {"event", "data", "id", "retry"}
 _PROVIDER_STREAM_ERROR_TEXT_LIMIT = 4096
+# Stale kills fire a fixed 900s after the last chunk, so an instant retry re-enters the
+# provider on the same clock phase that killed it (incident t_22b546e3: fleet-wide deaths
+# synchronized on a ~1798s renew cadence). One random wait on the FIRST post-stale retry
+# decouples it; every other retry path keeps its existing backoff.
+STALE_RETRY_JITTER_S = (30.0, 60.0)
 
 # Fallback chain exhausted on a non-rate-limit failure (#24996): arm a short
 # cooldown so the NEXT turn's restore_primary_runtime stays gated instead of
@@ -557,6 +563,27 @@ def _record_interrupted_provider_wait(agent, elapsed: float, *, response_started
     logger.warning("Interrupted provider wait counted as stale after %.0fs with no output; "
         "consecutive stale attempts=%d.", elapsed, _stale_streak(agent))
     return True
+
+
+def _interruptible_stale_retry_wait(agent, seconds: float, *, sleeper=None, clock=None) -> bool:
+    """Sleep ``seconds`` in 200 ms slices so /stop is honoured during the post-stale
+    jitter, mirroring ``turn_recovery.interruptible_backoff_sleep`` (that helper needs
+    turn state this request worker does not carry). Returns False on interrupt."""
+    _sleep = sleeper or time.sleep
+    _now = clock or time.time
+    sleep_end = _now() + seconds
+    _touch_counter = 0
+    while True:
+        if getattr(agent, "_interrupt_requested", False):
+            return False
+        remaining = sleep_end - _now()
+        if remaining <= 0:
+            return True
+        _sleep(min(0.2, remaining))
+        _touch_counter += 1
+        if _touch_counter % 150 == 0:  # 150 × 0.2s = 30s
+            agent._touch_activity(
+                f"stale stream retry jitter, {int(max(0.0, sleep_end - _now()))}s remaining")
 
 
 def _report_stale_nonstream_kill(agent, api_kwargs: dict, elapsed: float, stale_timeout: float, *,
@@ -2707,6 +2734,8 @@ class _StreamingCall(StreamingWaitMonitor):
         # Request-local cancel flag: the worker recognizes its own interrupt
         # force-close (RemoteProtocolError) and exits instead of retrying (#6600).
         self._request_cancelled = {"value": False}
+        # Set by ``_kill_stale_stream``, consumed once by ``_wait_out_stale_retry_jitter``.
+        self._stale_kill_pending = {"yes": False}
         self.first_delta_fired = {"done": False}
         self.deltas_were_sent = {"yes": False}  # for the partial-delivery fallback
         self.provider_tool_in_flight = {"yes": False}
@@ -3511,6 +3540,9 @@ class _StreamingCall(StreamingWaitMonitor):
                 if self.agent._interrupt_requested:
                     self._cancel_current_stream_attempt("interrupt_before_stream_retry")
                     raise InterruptedError("Agent interrupted before stream retry")
+                if not self._wait_out_stale_retry_jitter():
+                    self._cancel_current_stream_attempt("interrupt_during_stale_retry_wait")
+                    raise InterruptedError("Agent interrupted during post-stale retry wait")
                 try:
                     self.result["response"] = _with_stream_emitters(
                         self.agent, lambda: self._call_wire(stream_attempt_id))
@@ -3576,6 +3608,20 @@ class _StreamingCall(StreamingWaitMonitor):
         except Exception:
             logger.debug("Stale stream socket shutdown failed", exc_info=True)
 
+    def _wait_out_stale_retry_jitter(self, *, rng=None, sleeper=None, clock=None) -> bool:
+        """Wait 30-60s before the FIRST retry that follows a stale kill, so the
+        new attempt does not land on the same provider clock phase that killed
+        the last one. One-shot: every other retry path pays nothing. Returns
+        False when the user interrupted the wait."""
+        if not self._stale_kill_pending["yes"]:
+            return True
+        self._stale_kill_pending["yes"] = False
+        low, high = STALE_RETRY_JITTER_S
+        jitter = (rng or random.uniform)(low, high)
+        logger.info("stale_retry jitter=%.1fs (window %.0f-%.0fs) before next stream attempt",
+                    jitter, low, high)
+        return _interruptible_stale_retry_wait(self.agent, jitter, sleeper=sleeper, clock=clock)
+
     def _kill_stale_stream(self, elapsed: float) -> None:
         """SSE pings but no chunks: cancel the attempt and abort the request-local
         client so the retry loop opens a fresh one. The shared client is never
@@ -3599,6 +3645,8 @@ class _StreamingCall(StreamingWaitMonitor):
             self.clients.close_once("stale_stream_kill")
         self._shutdown_stale_attempt_socket(_killed_response)
         _bump_stale_streak(self.agent)  # circuit breaker, see ``_stale_streak()``
+        # The next attempt pays one jittered wait (see STALE_RETRY_JITTER_S).
+        self._stale_kill_pending["yes"] = True
         # Reset the timer so we don't kill repeatedly while the worker unwinds.
         self.last_chunk_time["t"] = time.time()
         self.agent._emit_diagnostic_wait(f"⚠ no output from provider for {int(elapsed)}s — reconnecting...")
