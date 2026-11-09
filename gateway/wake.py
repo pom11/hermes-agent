@@ -125,12 +125,16 @@ def _runner_draining(adapter: Any) -> bool:
 
 
 async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source: Any = None,
-                       notification_category: str = "result", profile: Optional[str] = None) -> None:
+                       notification_category: str = "result", profile: Optional[str] = None,
+                       dedupe: Optional[str] = None) -> None:
     """Deliver a wake turn to the session behind ``adapter``. ``session_id`` is the RAW session id
     (``X-Hermes-Session-Id`` / state.db key) — required for non-push adapters. ``source`` is the
     ``SessionSource`` for the synthetic event — required for push-capable adapters. ``profile``
     names the served profile that canonically owns a non-push destination; a non-default value is
     delivered in-process under the caller's profile scope (see ``_self_post_chat_completion``).
+    ``dedupe`` names this wake for the durable admission identity (see ``admit_route_wake``), so a
+    producer that retries the same wake replays one admission instead of queueing another; the
+    self-post branch has no admission to key, so it is unused there.
     Raises on failure so the caller can rewind/retry."""
     if adapter_supports_push(adapter):
         if source is None:
@@ -142,7 +146,7 @@ async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source:
             from hermes_state_runtime import RuntimeStoreError
             category = {"notification_category": notification_category} if notification_category != "result" else {}
             try:
-                if await admit_route_wake(runner, adapter, source, text, "kanban-wake", category):
+                if await admit_route_wake(runner, adapter, source, text, "kanban-wake", category, dedupe):
                     return  # committed to the session FIFO: never interrupts the admitted turn
             except RuntimeStoreError as exc:
                 raise WakeNotAccepted(str(exc), reason=exc.reason) from exc

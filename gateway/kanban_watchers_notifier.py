@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import re
 from functools import partial
 from pathlib import Path
@@ -488,6 +489,21 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, _KanbanNotification], tuple]] = {
 # --- Delivery of one claimed batch (one subscription, N events) ---
 
 
+def _wake_dedupe_token(board: Any, task_id: str, events: list) -> Optional[str]:
+    """This wake's durable identity: the exact ``task_events`` ids it was built from.
+
+    The notifier's cursor claim already makes this batch unique, so naming the wake by its event
+    ids is what turns the cursor's "claimed" into an admission the fence can replay: a retry of an
+    already-woken event replays one admission instead of queueing a second copy, while two events
+    of the same task in the same second stay two wakes (never a wall-clock window, never status).
+    ``None`` names nothing, which leaves the caller on today's fresh-uuid identity.
+    """
+    ids = sorted(ev.id for ev in events)
+    if not ids:
+        return None
+    return f"kanban:{board}:{task_id}:{hashlib.sha1(','.join(map(str, ids)).encode('utf-8')).hexdigest()}"
+
+
 class _KanbanNotification:
     """Deliver one subscription's claimed events, then settle the cursor.
 
@@ -524,6 +540,8 @@ class _KanbanNotification:
         self.adapter: Any = None
         self.is_push_adapter = True
         self.wake_kinds: set = set()
+        # This wake's admission-dedupe token, set per wake payload in deliver() (None = uuid).
+        self.wake_dedupe: Optional[str] = None
 
     # -- cursor / subscription ops (blocking, run in a fresh-context thread) --
 
@@ -669,7 +687,8 @@ class _KanbanNotification:
                 raise RuntimeError(f"Kanban wake profile {self.sub_profile!r} no longer exists")
         async with _async_profile_runtime_scope(self.runner._resolve_profile_home_for_source(_source)):
             await deliver_wake(self.adapter, text=self.synth, session_id=self.session_key, source=_source,
-                               notification_category="diagnostic" if self.wake_diagnostic else "result")
+                               notification_category="diagnostic" if self.wake_diagnostic else "result",
+                               dedupe=self.wake_dedupe)
         self._log_woke()
 
     async def _send_event(self, ev: Any, msg: str) -> bool:
@@ -788,7 +807,8 @@ class _KanbanNotification:
                     self.format_event(ev)
                 self.build_wake_text()
                 if self.wake_kinds:
-                    wake_payloads.append((self.synth, self.wake_diagnostic, self.wake_kinds))
+                    wake_payloads.append((self.synth, self.wake_diagnostic, self.wake_kinds,
+                                          _wake_dedupe_token(self.board_slug, self.task_id, events)))
             self.d = {**self.d, "events": original_events}
         is_push = self.is_push_adapter
         from gateway.wake import WakeNotAccepted
@@ -796,7 +816,7 @@ class _KanbanNotification:
         # A requested wake is required even when its passive ping already landed.
         if wake_payloads:
             try:
-                for self.synth, self.wake_diagnostic, self.wake_kinds in wake_payloads:
+                for self.synth, self.wake_diagnostic, self.wake_kinds, self.wake_dedupe in wake_payloads:
                     await self.wake()
                 self.clear_failures()
             except WakeNotAccepted:
