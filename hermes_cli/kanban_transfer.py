@@ -72,6 +72,11 @@ def _scrub_local_state(conn: sqlite3.Connection) -> None:
     gateway chat ids subscribed to task events). Caller owns the transaction.
     Run on export and again on import (an archive is untrusted input)."""
     conn.execute("DELETE FROM kanban_notify_subs")
+    # A wake claim is machine-local runtime state too, and shipping it is worse
+    # than shipping a stale chat id: the importer's notifier would read
+    # "this profile was already woken for that event" for a wake that never
+    # happened on the importer's board — a silently dropped wake.
+    conn.execute("DELETE FROM kanban_wake_claims")
     conn.execute(
         """
         UPDATE tasks

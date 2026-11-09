@@ -971,6 +971,29 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Wake-once claim: "someone already owes <profile> a wake for <event_id>".
+-- Two emitters can wake the same profile for the same ``task_events`` row
+-- (the in-tree gateway notifier and any out-of-process waker that opens this
+-- same board DB), and nothing durable used to record the first one, so the
+-- second emitter had to infer it from a cursor that means "claimed", not
+-- "delivered". See hermes-agent#152206 §3.1.
+-- The key is event identity and nothing else: ``event_id`` is the
+-- ``task_events.id``, which already pins (task, kind, created_at), and it is
+-- the exact value a wake-dedupe token is hashed from, so one event has one
+-- name on both halves. Never wall-clock proximity, never task status.
+-- A row is a short LEASE while ``confirmed_at`` is NULL (a claimed wake whose
+-- sender crashed stops suppressing after ``lease_s``) and a receipt once
+-- confirmed. Writers: ``kanban_db_notify.try_claim_wake`` and friends.
+CREATE TABLE IF NOT EXISTS kanban_wake_claims (
+    profile       TEXT NOT NULL,
+    task_id       TEXT NOT NULL,
+    event_id      INTEGER NOT NULL,
+    emitter       TEXT NOT NULL,
+    claimed_at    INTEGER NOT NULL,
+    confirmed_at  INTEGER,
+    PRIMARY KEY (profile, task_id, event_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
