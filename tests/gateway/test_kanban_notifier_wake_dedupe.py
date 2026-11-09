@@ -19,7 +19,9 @@ from hermes_cli import kanban_db_notify as kbn
 
 
 class RecordingAdapter:
-    """Push-capable adapter (no supports_async_delivery attr => push)."""
+    """A push-capable stand-in: it declares nothing, so ``adapter_supports_push`` (``gateway/wake.py:35``)
+    defaults it to True — real adapters inherit ``supports_async_delivery: bool = True`` from
+    ``BasePlatformAdapter`` (``gateway/platforms/base.py:1824``)."""
 
     def __init__(self):
         self.sent = []
