@@ -29,6 +29,47 @@ async def test_kanban_wake_is_admitted_into_a_local_chat(tmp_path, monkeypatch):
     assert len(_admissions(authority, ref, 'card t1 done')) == 1
 
 
+LOCAL_WAKE_TOKEN = "kanban:ops:t_1:" + "a" * 40
+
+
+@pytest.mark.asyncio
+async def test_a_named_local_wake_is_admitted_under_that_name(tmp_path, monkeypatch):
+    """A ``platform=local`` kanban wake must reach ``admit_route_wake``.
+
+    The ``dedupe`` token is only worth having because of the durable admission it names, and a local
+    route (Desktop/TUI chat, an out-of-process waker's sub) is how most of these wakes travel.
+    ``BasePlatformAdapter`` declares ``supports_async_delivery: bool = True``
+    (``gateway/platforms/base.py:1824``) and ``LocalSessionAdapter`` inherits it, so today this wake
+    takes ``deliver_wake``'s push branch and lands in ``session_admissions``. The self-post branch
+    admits nothing and mints no identity, so if push-ness for local sessions ever changes, every
+    guarantee the token offers stops covering them — with nothing else in the suite failing. This is
+    the cheap assertion that hears about it.
+    """
+    import json
+
+    from gateway.wake import deliver_wake
+    from hermes_state_runtime import list_session_admissions
+    runner, authority, ref, _ = await _local(tmp_path, monkeypatch)
+    live = authority.sessions[ref.session_id]
+    adapter = runner._delivery_adapter_for(live.source)
+
+    async def wake():
+        await deliver_wake(adapter, text='card t1 done', session_id=ref.session_id,
+                           source=live.source, dedupe=LOCAL_WAKE_TOKEN)
+    await wake()
+    await wake()  # the same wake retried: the fence replays it, it does not queue a copy
+
+    rows = [row for row in list_session_admissions(authority.db, session_id=ref.session_id, pending_only=False)
+            if row['payload'].get('local_automation_v1')]
+    assert len(rows) == 1, f"a named local wake retried must hold one admission, got {[r['request_id'] for r in rows]}"
+    identity = json.loads(rows[0]['request_id'])
+    assert identity[0] == 'kanban-wake', f"a route wake is still identified by its producer head: {identity}"
+    assert identity[2] == LOCAL_WAKE_TOKEN, f"the caller's token is the identity's third element: {identity}"
+    assert rows[0]['payload']['local_automation_v1']['identity'] == rows[0]['request_id'], (
+        'the identity rides the payload, which is what check_local_automation compares on claim'
+    )
+
+
 def _overdue_heartbeat(session_id):
     from hermes_cli.heartbeat import HeartbeatManager, save_heartbeat
     state = HeartbeatManager(session_id).set('status tick', 60)
