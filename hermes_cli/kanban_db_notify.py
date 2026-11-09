@@ -456,6 +456,207 @@ def rewind_notify_cursor(
     return cur.rowcount > 0
 
 
+# --- Wake-once claim (hermes-agent#152206 §3.1) ----------------------------
+#
+# ``kanban_notify_subs.last_event_id`` says "the notifier consumed this event",
+# not "the recipient was woken", so a second emitter that wakes the same profile
+# for the same ``task_events`` row has nothing to ask. These four functions are
+# that record: one row per (profile, task, event) in the board DB both emitters
+# already open, keyed by event identity alone. Callers that decide whether to
+# deliver must treat every unknown as "deliver" — see :func:`_wake_claim_open`.
+#
+# Suppression is only ever as wide as what a caller claims, so a kind that must
+# never wake (``spawn_failed`` and the rest outside the notifier's ``_WAKE_KINDS``)
+# simply is never claimed and can never suppress anything. The kind filter stays
+# with the emitters; this table holds no opinion about it.
+
+# Lease on an unconfirmed claim: long enough to cover a slow send, short enough
+# that an emitter crashing between claim and wake mutes one event briefly rather
+# than permanently. Not user-configurable — a claim that suppresses only what a
+# live lease or a confirmed delivery covers can never drop a wake that would
+# otherwise have fired.
+_WAKE_CLAIM_LEASE_S = 120
+
+_WAKE_CLAIM_KEY_WHERE = "WHERE profile = ? AND task_id = ? AND event_id = ?"
+
+
+def _wake_claim_open(exc: sqlite3.Error, op: str, fallback: Any) -> Any:
+    """Fail-open verdict for a claim read/write that could not happen.
+
+    The answer is always the one that still delivers the wake (#152206 §4): a
+    doubled wake is the status quo, a dropped one is a regression. A board whose
+    DB predates the table is the expected shape on an un-migrated board — every
+    hermes-opened board gets it from ``SCHEMA_SQL`` at connect(), so an absent
+    table means a foreign or legacy opener, not a bug; it is not worth a
+    WARNING on every notifier tick.
+    """
+    if "no such table" in str(exc).lower():
+        _kb._log.debug("kanban wake claim: %s skipped, table absent (%s)", op, exc)
+    else:
+        _kb._log.warning(
+            "kanban wake claim: %s failed (%s); failing open towards delivering", op, exc
+        )
+    return fallback
+
+
+def _wake_claim_row(
+    conn: sqlite3.Connection, *, profile: str, task_id: str, event_id: int
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT emitter, claimed_at, confirmed_at FROM kanban_wake_claims "
+        + _WAKE_CLAIM_KEY_WHERE,
+        (profile, task_id, int(event_id)),
+    ).fetchone()
+
+
+def try_claim_wake(
+    conn: sqlite3.Connection,
+    *,
+    profile: str,
+    task_id: str,
+    event_id: int,
+    emitter: str,
+    now: Optional[int] = None,
+    lease_s: int = _WAKE_CLAIM_LEASE_S,
+) -> bool:
+    """Take the wake claim for one event. ``True`` = you owe this wake.
+
+    Succeeds only when the event is unclaimed or its claim is an *unconfirmed*
+    lease that has run past ``lease_s`` — the expired take-over re-stamps both
+    emitter and clock, so a crashed sender mutes the event for at most
+    ``lease_s`` seconds. Anything else answers ``False``: a live lease means
+    somebody else already owes it, a confirmed row means it was already
+    delivered. Then call :func:`confirm_wake` once the wake was accepted, or
+    :func:`release_wake` when it was not.
+
+    Callers must not already hold a ``write_txn`` (same rule as the cursor CAS
+    helpers above), and must not claim a non-wake-bearing kind — see the block
+    comment on this group.
+    """
+    moment = int(now if now is not None else time.time())
+    lease = int(lease_s)
+    try:
+        with _kb.write_txn(conn):
+            row = _wake_claim_row(conn, profile=profile, task_id=task_id, event_id=event_id)
+            if row is None:
+                conn.execute(
+                    "INSERT INTO kanban_wake_claims"
+                    " (profile, task_id, event_id, emitter, claimed_at, confirmed_at)"
+                    " VALUES (?, ?, ?, ?, ?, NULL)",
+                    (profile, task_id, int(event_id), emitter, moment),
+                )
+                return True
+            if row["confirmed_at"] is not None:
+                return False
+            if moment - int(row["claimed_at"]) < lease:
+                return False
+            # Expired lease. CAS on the expiry so a concurrent take-over that
+            # committed between our SELECT and here loses instead of overwriting.
+            taken = conn.execute(
+                "UPDATE kanban_wake_claims"
+                " SET emitter = ?, claimed_at = ?, confirmed_at = NULL "
+                + _WAKE_CLAIM_KEY_WHERE
+                + " AND confirmed_at IS NULL AND claimed_at <= ?",
+                (emitter, moment, profile, task_id, int(event_id), moment - lease),
+            )
+            return taken.rowcount > 0
+    except sqlite3.Error as exc:
+        return _wake_claim_open(exc, "try_claim_wake", True)
+
+
+def confirm_wake(
+    conn: sqlite3.Connection,
+    *,
+    profile: str,
+    task_id: str,
+    event_id: int,
+    emitter: str,
+    now: Optional[int] = None,
+) -> bool:
+    """Settle the claim as delivered; ``True`` when this emitter's lease settled.
+
+    Only the holder may confirm — one emitter must not spend another's lease —
+    and an already-confirmed row is left alone (first delivery wins). A failed
+    confirm leaves an unconfirmed lease, which stops suppressing at ``lease_s``:
+    the cost is a doubled wake, never a dropped one.
+    """
+    moment = int(now if now is not None else time.time())
+    try:
+        with _kb.write_txn(conn):
+            cur = conn.execute(
+                "UPDATE kanban_wake_claims SET confirmed_at = ? "
+                + _WAKE_CLAIM_KEY_WHERE
+                + " AND emitter = ? AND confirmed_at IS NULL",
+                (moment, profile, task_id, int(event_id), emitter),
+            )
+        return cur.rowcount > 0
+    except sqlite3.Error as exc:
+        return _wake_claim_open(exc, "confirm_wake", False)
+
+
+def release_wake(
+    conn: sqlite3.Connection,
+    *,
+    profile: str,
+    task_id: str,
+    event_id: int,
+    emitter: str,
+) -> bool:
+    """Drop this emitter's claim so the wake is owed again — call it when the
+    send was refused (``WakeNotAccepted``) or raised, mirroring
+    :func:`rewind_notify_cursor`'s discipline for the notifier's own cursor.
+
+    A refused send must not mute the other emitter. Only the holder may release:
+    a lease that already expired belongs to whoever took it over, and deleting
+    that row would hand the same event to a third sender.
+    """
+    try:
+        with _kb.write_txn(conn):
+            cur = conn.execute(
+                "DELETE FROM kanban_wake_claims " + _WAKE_CLAIM_KEY_WHERE + " AND emitter = ?",
+                (profile, task_id, int(event_id), emitter),
+            )
+        return cur.rowcount > 0
+    except sqlite3.Error as exc:
+        return _wake_claim_open(exc, "release_wake", False)
+
+
+def wake_already_claimed(
+    conn: sqlite3.Connection,
+    *,
+    profile: str,
+    task_id: str,
+    event_ids: Iterable[int],
+    now: Optional[int] = None,
+    lease_s: int = _WAKE_CLAIM_LEASE_S,
+) -> set[int]:
+    """The subset of ``event_ids`` that must NOT be woken again for ``profile``.
+
+    Read-only (safe on a read-only connection — the out-of-process waker opens
+    the board that way) and the public "was this already woken?" hook. A
+    confirmed delivery suppresses forever; an unconfirmed lease only until it
+    expires. Any failure returns the empty set — nothing is known to be claimed,
+    so the caller delivers; that is the whole point of the fail-open posture.
+    """
+    ids = sorted({int(e) for e in event_ids})
+    if not ids:
+        return set()
+    moment = int(now if now is not None else time.time())
+    cutoff = moment - int(lease_s)
+    placeholders = ",".join("?" * len(ids))
+    try:
+        rows = conn.execute(
+            "SELECT event_id FROM kanban_wake_claims"
+            " WHERE profile = ? AND task_id = ?"
+            f" AND event_id IN ({placeholders})"
+            " AND (confirmed_at IS NOT NULL OR claimed_at > ?)",
+            (profile, task_id, *ids, cutoff),
+        ).fetchall()
+    except sqlite3.Error as exc:
+        return _wake_claim_open(exc, "wake_already_claimed", set())
+    return {int(r["event_id"]) for r in rows}
+
+
 # Late-bound origin namespace (see module docstring); imported LAST so this
 # module is fully populated before ``kanban_db`` imports from it.
 from hermes_cli import kanban_db as _kb

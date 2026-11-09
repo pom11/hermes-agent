@@ -220,6 +220,30 @@ def test_gateway_subscriptions_never_travel(kanban_root, tmp_path):
     assert b"12345" not in Path(archive).read_bytes()
 
 
+def test_wake_claims_never_travel(kanban_root, tmp_path):
+    """A wake-once claim is machine-local runtime state like a chat
+    subscription. Shipping it would tell the importer's notifier that the
+    profile was already woken for an event it never woke for — that is a
+    dropped wake, not a deduplicated one."""
+    ids = _seed_board()
+    with kbc.connect_closing(board="alpha") as conn:
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO kanban_wake_claims "
+                "(profile, task_id, event_id, emitter, claimed_at, confirmed_at) "
+                "VALUES ('hscc-orch', ?, 1, 'hscc-orch-waker', ?, NULL)",
+                (ids["scratch"], int(time.time())),
+            )
+    archive = kt.export_board("alpha", str(tmp_path / "alpha"))["archive"]
+
+    kanban_root("target")
+    result = kt.import_board(archive)
+    with kbc.connect_closing(board=result["board"]) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM kanban_wake_claims"
+        ).fetchone()[0] == 0
+
+
 def test_unresolvable_workspaces_are_parked_not_dispatched(kanban_root, tmp_path):
     _seed_board()
     archive = kt.export_board("alpha", str(tmp_path / "alpha"))["archive"]
