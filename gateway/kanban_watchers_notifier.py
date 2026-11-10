@@ -547,17 +547,16 @@ def _wake_claim_take(board: Optional[str], *, profile: str, task_id: str,
             try:
                 for event_id in event_ids:
                     event_id = int(event_id)
-                    if kbn.try_claim_wake(conn, profile=profile, task_id=task_id,
-                                          event_id=event_id, emitter=_WAKE_EMITTER):
-                        granted.add(event_id)
-                    elif kbn.wake_claim_holder(conn, profile=profile, task_id=task_id,
-                                               event_id=event_id) == _WAKE_EMITTER:
+                    claimed = kbn.try_claim_wake(conn, profile=profile, task_id=task_id,
+                                                 event_id=event_id, emitter=_WAKE_EMITTER)
+                    if claimed or kbn.wake_claim_holder(conn, profile=profile, task_id=task_id,
+                                                        event_id=event_id) == _WAKE_EMITTER:
                         granted.add(event_id)
             finally:
                 conn.close()
-    except Exception as exc:
-        logger.debug("kanban notifier: wake claim unavailable for %s (%s); delivering anyway",
-                     task_id, exc)
+    except Exception:  # health: allow BLE001 -- fail-open (#152206 §4): unexpected = nothing claimed, still deliver
+        logger.debug("kanban notifier: wake claim unavailable for %s; delivering anyway",
+                     task_id, exc_info=True)
         return {int(e) for e in event_ids}
     return granted
 
@@ -581,8 +580,9 @@ def _wake_claim_settle(board: Optional[str], *, profile: str, task_id: str,
                            event_id=int(event_id), emitter=_WAKE_EMITTER)
             finally:
                 conn.close()
-    except Exception as exc:
-        logger.debug("kanban notifier: wake claim %s unavailable for %s (%s)", op, task_id, exc)
+    except Exception:  # health: allow BLE001 -- a claim that cannot settle stops suppressing on its lease; never abort a delivered wake
+        logger.debug("kanban notifier: wake claim %s unavailable for %s; the claim stops "
+                     "suppressing when its lease expires", op, task_id, exc_info=True)
 
 
 class _WakePayload(NamedTuple):
@@ -740,7 +740,9 @@ class _KanbanNotification:
             return self.sub_profile
         try:
             return str(self.runner._active_profile_name() or "").strip() or "default"
-        except Exception:
+        except Exception:  # health: allow BLE001 -- the key must resolve to something; worst case is no suppression, never a dropped wake
+            logger.debug("kanban notifier: cannot resolve the active profile for the wake "
+                         "claim; the row keys on the default profile", exc_info=True)
             return "default"
 
     async def _claim_wake(self, events: list) -> set[int]:
@@ -781,9 +783,9 @@ class _KanbanNotification:
                 continue
             try:
                 await self._settle_wake(event_ids, delivered=False)
-            except Exception as exc:
-                logger.debug("kanban notifier: wake claim release failed for %s (%s)",
-                             self.task_id, exc)
+            except Exception:  # health: allow BLE001 -- best-effort: a failing release must not swallow the cursor rewind that follows
+                logger.debug("kanban notifier: wake claim release failed for %s",
+                             self.task_id, exc_info=True)
 
     def _served_wake_profile(self) -> Optional[str]:
         """The subscription's profile when THIS gateway is a multiplexer serving it, else ``None``.
