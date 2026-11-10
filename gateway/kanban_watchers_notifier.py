@@ -14,7 +14,7 @@ import re
 from functools import partial
 from pathlib import Path
 import weakref
-from typing import Any, Callable, Optional
+from typing import Any, Callable, NamedTuple, Optional
 
 from agent.i18n import t
 
@@ -504,6 +504,86 @@ def _wake_dedupe_token(board: Any, task_id: str, events: list) -> Optional[str]:
     return f"kanban:{board}:{task_id}:{hashlib.sha1(','.join(map(str, ids)).encode('utf-8')).hexdigest()}"
 
 
+# --- Wake-once claim (#152206 §3.1, wired here) -----------------------------
+#
+# The subscription cursor records what THIS notifier consumed; the ``kanban_wake_claims``
+# row records that a PROFILE was woken for an event, which is the one fact a second
+# emitter (the out-of-process waker) can ask about before it wakes the same profile for
+# the same ``task_events`` row. The notifier is a writer of that record: it takes the
+# claim for what it is about to wake, confirms it when the wake is accepted and deletes
+# it when the send was refused.
+#
+# Two boundaries, deliberately not merged. §A's token above is the wake's NAME — one
+# admission per name at the fence, what makes a same-emitter retry idempotent. This claim
+# is the OWING — which emitter owes the wake, what suppresses a different emitter. The
+# claim set is exactly the group's ``_WAKE_KINDS`` ids, so a kind outside it
+# (``spawn_failed``, ``archived``, a bare ``status``) is never claimed and can never
+# suppress a wake however many rows exist for it.
+_WAKE_EMITTER = "gateway-notifier"
+
+
+def _wake_claim_take(board: Optional[str], *, profile: str, task_id: str,
+                     event_ids: list[int]) -> set[int]:
+    """Take this notifier's claim for each wake-bearing event; return the ids it holds.
+
+    Blocking (board-DB) work: call it through ``_to_thread_process_service``. Fail-open
+    twice over — §B's ``try_claim_wake`` answers "yours" for an absent table or a sqlite
+    error, and this wrapper answers "all yours" for a board it cannot even open or a build
+    without the helpers. Every unknown delivers: a doubled wake is the status quo, a
+    dropped one is the regression (#152206 §4).
+    """
+    granted: set[int] = set()
+    try:
+        kbn = _kbn()
+        with _pin_first():
+            conn = _kbc().connect(board=board)
+            try:
+                for event_id in event_ids:
+                    if kbn.try_claim_wake(conn, profile=profile, task_id=task_id,
+                                          event_id=int(event_id), emitter=_WAKE_EMITTER):
+                        granted.add(int(event_id))
+            finally:
+                conn.close()
+    except Exception as exc:
+        logger.debug("kanban notifier: wake claim unavailable for %s (%s); delivering anyway",
+                     task_id, exc)
+        return {int(e) for e in event_ids}
+    return granted
+
+
+def _wake_claim_settle(board: Optional[str], *, profile: str, task_id: str,
+                       event_ids: list[int], delivered: bool) -> None:
+    """Confirm the claims whose wake landed, delete the ones whose send was refused.
+
+    Holder-only on both sides, so a lease another emitter took over is left alone. Same
+    fail-open posture as the take: a claim that cannot be settled stops suppressing once
+    its lease runs out, which costs a doubled wake at worst, never a dropped one.
+    """
+    op = "confirm_wake" if delivered else "release_wake"
+    try:
+        settle = getattr(_kbn(), op)
+        with _pin_first():
+            conn = _kbc().connect(board=board)
+            try:
+                for event_id in event_ids:
+                    settle(conn, profile=profile, task_id=task_id,
+                           event_id=int(event_id), emitter=_WAKE_EMITTER)
+            finally:
+                conn.close()
+    except Exception as exc:
+        logger.debug("kanban notifier: wake claim %s unavailable for %s (%s)", op, task_id, exc)
+
+
+class _WakePayload(NamedTuple):
+    """One wake the notifier owes: its text, §A's name for it, and the §B claims held."""
+
+    synth: str
+    diagnostic: bool
+    kinds: set
+    dedupe: Optional[str]
+    claimed: list[int]
+
+
 class _KanbanNotification:
     """Deliver one subscription's claimed events, then settle the cursor.
 
@@ -619,9 +699,80 @@ class _KanbanNotification:
             synth += "\n" + t("gateway.kanban.wake.review_detail", reason=self.wake_review_detail)
         self.synth = synth + "\n\n" + t("gateway.kanban.wake.guidance")
 
+    def _render_wake(self, events: list) -> None:
+        """Render one candidate group; the caller reads the resulting ``wake_kinds``.
+
+        Its own method because §3.1 may render a group twice: once with the whole batch,
+        once with the events the other emitter did not already claim.
+        """
+        self.d = {**self.d, "events": events}
+        self.wake_handoff = self.wake_review_detail = ""
+        for ev in events:
+            self.format_event(ev)
+        self.build_wake_text()
+
     def _log_woke(self) -> None:
         logger.info("kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",
                     self.task_id, self.platform_str, self.sub["chat_id"], self.sub_profile or "default", self.wake_kinds)
+
+    # -- wake-once claim (#152206 §3.1) --
+
+    def _wake_claim_profile(self) -> str:
+        """The profile the wake lands in — the key the other emitter asks about.
+
+        A key the two emitters disagree on simply never suppresses (fail-open, so a
+        doubled wake rather than a dropped one), which is why it is worth resolving
+        instead of defaulting: a stamped subscription wakes that profile, and an
+        un-stamped one wakes the profile this gateway is running.
+        """
+        if self.sub_profile:
+            return self.sub_profile
+        try:
+            return str(self.runner._active_profile_name() or "").strip() or "default"
+        except Exception:
+            return "default"
+
+    async def _claim_wake(self, events: list) -> set[int]:
+        """Claim this group's wake-bearing events; return the ids now held by us.
+
+        Only ``_WAKE_KINDS`` rows are claimed, so a non-wake-bearing kind can never mute a
+        wake by having a claim row of its own. And the claim is taken AFTER the pings: a
+        failed ping rewinds the cursor and retries the whole batch, and a claim already
+        held across that would suppress the retry's own wake.
+        """
+        wake_ids = sorted({int(ev.id) for ev in events if ev.kind in _WAKE_KINDS})
+        if not wake_ids:
+            return set()
+        return await _to_thread_process_service(
+            partial(_wake_claim_take, self.board_slug, profile=self._wake_claim_profile(),
+                    task_id=self.task_id, event_ids=wake_ids))
+
+    async def _settle_wake(self, event_ids: list[int], *, delivered: bool) -> None:
+        """Confirm the claims whose wake landed, hand back the ones whose send did not.
+
+        A refused send that keeps its claim mutes the other emitter for the length of the
+        lease, which is exactly the dropped wake §3.1 exists to avoid.
+        """
+        if not event_ids:
+            return
+        await _to_thread_process_service(
+            partial(_wake_claim_settle, self.board_slug, profile=self._wake_claim_profile(),
+                    task_id=self.task_id, event_ids=list(event_ids), delivered=delivered))
+
+    async def _release_unconfirmed(self, unconfirmed: list) -> None:
+        """Give back every claim whose wake was never accepted.
+
+        Best-effort on purpose: a release that itself fails must not swallow the cursor
+        rewind the caller is about to do, which is the retry that actually matters.
+        """
+        for event_ids in unconfirmed:
+            if not event_ids:
+                continue
+            try:
+                await self._settle_wake(event_ids, delivered=False)
+            except Exception as exc:
+                logger.debug("kanban notifier: wake claim release failed for %s (%s)",
+                             self.task_id, exc)
 
     def _served_wake_profile(self) -> Optional[str]:
         """The subscription's profile when THIS gateway is a multiplexer serving it, else ``None``.
@@ -797,34 +948,58 @@ class _KanbanNotification:
                 [ev for ev in original_events if diagnostic_event(ev)],
                 [ev for ev in original_events if not diagnostic_event(ev)],
             ])
-            wake_payloads = []
+            wake_payloads: list[_WakePayload] = []
             for events in wake_groups:
                 if not events:
                     continue
-                self.d = {**self.d, "events": events}
-                self.wake_handoff = self.wake_review_detail = ""
-                for ev in events:
-                    self.format_event(ev)
-                self.build_wake_text()
-                if self.wake_kinds:
-                    wake_payloads.append((self.synth, self.wake_diagnostic, self.wake_kinds,
-                                          _wake_dedupe_token(self.board_slug, self.task_id, events)))
+                self._render_wake(events)
+                if not self.wake_kinds:
+                    continue
+                # §3.1: claim the wake before sending it. A wake-bearing event another
+                # emitter already woke for this profile drops out of the group, so the
+                # text (and §A's name for it) covers only what we actually hold; a group
+                # whose every wake-bearing event went to someone else is not sent at all.
+                claimed = await self._claim_wake(events)
+                owed = [ev for ev in events if ev.kind not in _WAKE_KINDS or int(ev.id) in claimed]
+                if not any(ev.kind in _WAKE_KINDS for ev in owed):
+                    logger.info(
+                        "kanban notifier: wake for %s suppressed for profile %s — every wake-bearing "
+                        "event was already claimed by another emitter (board %s, events %s)",
+                        self.task_id, self._wake_claim_profile(), self.board_slug,
+                        sorted(int(ev.id) for ev in events if ev.kind in _WAKE_KINDS))
+                    continue
+                if len(owed) != len(events):
+                    self._render_wake(owed)
+                wake_payloads.append(_WakePayload(
+                    self.synth, self.wake_diagnostic, set(self.wake_kinds),
+                    _wake_dedupe_token(self.board_slug, self.task_id, owed), sorted(claimed)))
             self.d = {**self.d, "events": original_events}
         is_push = self.is_push_adapter
         from gateway.wake import WakeNotAccepted
 
         # A requested wake is required even when its passive ping already landed.
         if wake_payloads:
+            # Claims held for payloads not yet confirmed, index-aligned with the payloads:
+            # a wake that never lands gives its claim back, or the other emitter reads a
+            # live lease as "already woken" and the wake is dropped instead of doubled.
+            unconfirmed: list[list[int]] = [list(p.claimed) for p in wake_payloads]
             try:
-                for self.synth, self.wake_diagnostic, self.wake_kinds, self.wake_dedupe in wake_payloads:
+                for index, payload in enumerate(wake_payloads):
+                    self.synth, self.wake_diagnostic = payload.synth, payload.diagnostic
+                    self.wake_kinds, self.wake_dedupe = payload.kinds, payload.dedupe
                     await self.wake()
+                    await self._settle_wake(unconfirmed[index], delivered=True)
+                    unconfirmed[index] = []
                 self.clear_failures()
             except WakeNotAccepted:
                 # Startup / full queue is not a dead destination. Keep the durable
-                # subscription alive regardless of how long admission takes.
+                # subscription alive regardless of how long admission takes, and hand the
+                # claims back so the retry — or the other emitter — still owes the wake.
+                await self._release_unconfirmed(unconfirmed)
                 await self.rewind()
                 return
             except Exception as _wk_err:
+                await self._release_unconfirmed(unconfirmed)
                 await self._wake_failed(
                     "kanban notifier: wake-only delivery failed for %s (attempt %d/%d): %s" if is_push
                     else "kanban notifier: wake self-post failed for %s (attempt %d/%d): %s",
