@@ -515,7 +515,8 @@ def _wake_dedupe_token(board: Any, task_id: str, events: list) -> Optional[str]:
 #
 # Two boundaries, deliberately not merged. §A's token above is the wake's NAME — one
 # admission per name at the fence, what makes a same-emitter retry idempotent. This claim
-# is the OWING — which emitter owes the wake, what suppresses a different emitter. The
+# is the OWING — which emitter owes the wake, so it suppresses a DIFFERENT emitter and
+# never this one's own fan-out (see ``_wake_claim_take``). The
 # claim set is exactly the group's ``_WAKE_KINDS`` ids, so a kind outside it
 # (``spawn_failed``, ``archived``, a bare ``status``) is never claimed and can never
 # suppress a wake however many rows exist for it.
@@ -531,6 +532,12 @@ def _wake_claim_take(board: Optional[str], *, profile: str, task_id: str,
     error, and this wrapper answers "all yours" for a board it cannot even open or a build
     without the helpers. Every unknown delivers: a doubled wake is the status quo, a
     dropped one is the regression (#152206 §4).
+
+    A refusal is suppression only when ANOTHER emitter holds the claim. This emitter fans
+    one event out to every subscription that wants it — two subscriptions in one profile
+    are two destinations and two wakes, which §A's fence already separates by keying the
+    admission on the session the wake lands in. Arbitrating that fan-out is the
+    per-subscription cursor's job, so a claim we hold ourselves never mutes us.
     """
     granted: set[int] = set()
     try:
@@ -539,9 +546,13 @@ def _wake_claim_take(board: Optional[str], *, profile: str, task_id: str,
             conn = _kbc().connect(board=board)
             try:
                 for event_id in event_ids:
+                    event_id = int(event_id)
                     if kbn.try_claim_wake(conn, profile=profile, task_id=task_id,
-                                          event_id=int(event_id), emitter=_WAKE_EMITTER):
-                        granted.add(int(event_id))
+                                          event_id=event_id, emitter=_WAKE_EMITTER):
+                        granted.add(event_id)
+                    elif kbn.wake_claim_holder(conn, profile=profile, task_id=task_id,
+                                               event_id=event_id) == _WAKE_EMITTER:
+                        granted.add(event_id)
             finally:
                 conn.close()
     except Exception as exc:

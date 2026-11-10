@@ -43,7 +43,7 @@ class RecordingAdapter:
 
 
 class RecordingWake:
-    """Stands in for ``gateway.wake.deliver_wake``; records each wake's §A name."""
+    """Stands in for ``gateway.wake.deliver_wake``; records each wake's §A name and where it goes."""
 
     def __init__(self, refuse_first=False, raise_first=False):
         self.calls = []
@@ -52,7 +52,8 @@ class RecordingWake:
 
     async def __call__(self, adapter, *, text, session_id="", source=None,
                        notification_category="result", profile=None, dedupe=None):
-        self.calls.append({"text": text, "dedupe": dedupe})
+        self.calls.append({"text": text, "dedupe": dedupe, "session_id": session_id,
+                           "chat": getattr(source, "chat_id", None)})
         if self._refuse:
             self._refuse = False
             raise wake_mod.WakeNotAccepted("simulated refusal", reason="runtime_draining")
@@ -67,6 +68,10 @@ class RecordingWake:
     @property
     def texts(self):
         return [call["text"] for call in self.calls]
+
+    @property
+    def destinations(self):
+        return sorted(str(c["chat"] or c["session_id"] or "") for c in self.calls)
 
 
 def _make_runner():
@@ -224,6 +229,36 @@ def test_a_cross_emitter_claim_suppresses_the_wake_and_still_settles_the_cursor(
     row = _claim_for(db, event_id)
     assert row["emitter"] == WAKER and row["confirmed_at"] is not None, (
         f"holder-only ops leave another emitter's claim alone: {row}")
+
+
+def test_one_emitters_own_claim_never_suppresses_its_own_fan_out(tmp_path, monkeypatch):
+    """Two subscriptions in one profile are two destinations, so one event is two wakes.
+
+    §3.1 suppresses a DIFFERENT emitter's duplicate; it must not arbitrate this emitter's
+    fan-out, which the per-subscription cursor already settles and §A's fence already
+    separates — the admission identity is ``[producer, session key, name]``, so the same
+    name reaching two sessions is two admissions. A claim we hold is never our own mute.
+    """
+    db = _board(tmp_path, monkeypatch, "fan-out")
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="notify both", assignee="worker",
+                                 session_id="agent:main:telegram:dm:chat-1")
+        for chat in ("chat-1", "chat-2"):
+            kbn.add_notify_sub(conn, task_id=task_id, platform="telegram", chat_id=chat,
+                               chat_type="dm", delivery_mode="wake")
+        kb.complete_task(conn, task_id, summary="done")
+    (event_id,) = _events(db, task_id, "completed")
+
+    recorder = RecordingWake()
+    monkeypatch.setattr(wake_mod, "deliver_wake", recorder)
+    _tick(monkeypatch)
+
+    assert len(recorder.names) == 2, f"both destinations wake for one event: {recorder.names}"
+    assert recorder.names[0] == recorder.names[1], (
+        f"one event is one name; the destination separates them: {recorder.names}")
+    assert recorder.destinations == ["chat-1", "chat-2"], recorder.destinations
+    row = _claim_for(db, event_id)
+    assert row["emitter"] == "gateway-notifier" and row["confirmed_at"] is not None, row
 
 
 def test_a_failed_send_releases_the_claim_so_the_other_emitter_can_wake(tmp_path, monkeypatch):

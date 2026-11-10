@@ -657,6 +657,28 @@ def wake_already_claimed(
     return {int(r["event_id"]) for r in rows}
 
 
+def wake_claim_holder(
+    conn: sqlite3.Connection, *, profile: str, task_id: str, event_id: int
+) -> Optional[str]:
+    """The emitter whose claim currently covers this event, or ``None``.
+
+    ``None`` means nobody holds it (no row) *or* the read could not happen — both are
+    "deliver". The question exists because a refusal to claim is not always another
+    service's refusal: an emitter that fans one event out to several destinations (the
+    notifier, one subscription per destination) legitimately holds the claim it is being
+    refused by. Suppression is what a DIFFERENT emitter's claim means; an emitter's own
+    claim says nothing about whether its next destination was woken — its cursor does.
+    """
+    try:
+        row = conn.execute(
+            "SELECT emitter FROM kanban_wake_claims " + _WAKE_CLAIM_KEY_WHERE,
+            (profile, task_id, int(event_id)),
+        ).fetchone()
+    except sqlite3.Error as exc:
+        return _wake_claim_open(exc, "wake_claim_holder", None)
+    return str(row["emitter"]) if row is not None else None
+
+
 # Late-bound origin namespace (see module docstring); imported LAST so this
 # module is fully populated before ``kanban_db`` imports from it.
 from hermes_cli import kanban_db as _kb
